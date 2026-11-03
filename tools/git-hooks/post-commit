@@ -1,0 +1,12 @@
+#!/bin/sh
+# Opt in once with: git config core.hooksPath tools/git-hooks
+[ "$(git branch --show-current)" = main ] || exit 0
+root=$(git rev-parse --show-toplevel) || exit 0
+# Pass the path as data, not PowerShell source; preserve spaces and apostrophes.
+DESKSENTRY_DEPLOY_ROOT="$root" powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command '
+    $root = $env:DESKSENTRY_DEPLOY_ROOT
+    $script = Join-Path $root "tools/deploy.ps1"
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
+    Start-Process -FilePath powershell.exe -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden
+' </dev/null >/dev/null 2>&1 &
+exit 0
