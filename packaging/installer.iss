@@ -69,7 +69,7 @@ procedure RequestGracefulQuit;
 var
   Executable: String;
   ResultCode: Integer;
-  StartedAt: Cardinal;
+  Waited: Integer;
 begin
   Executable := InstalledExecutable;
   if FileExists(Executable) then
@@ -80,10 +80,13 @@ begin
       Log('Could not launch DeskSentry.exe --quit: ' + SysErrorMessage(ResultCode));
   end;
 
-  StartedAt := GetTickCount;
-  while CheckForMutexes('DeskSentry.SingleInstance') and
-    (GetTickCount - StartedAt < 10000) do
+  { Inno Pascal Script has no GetTickCount: count 100 ms polls, up to 10 s. }
+  Waited := 0;
+  while CheckForMutexes('DeskSentry.SingleInstance') and (Waited < 100) do
+  begin
     Sleep(100);
+    Waited := Waited + 1;
+  end;
 end;
 
 function InitializeSetup: Boolean;
