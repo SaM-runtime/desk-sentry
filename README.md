@@ -30,15 +30,15 @@ Desk Sentry 的人物偵測與辨識都在本機執行。程式不儲存攝影�
 - [專案原始碼](https://github.com/SaM-runtime/desk-sentry)
 <!-- desk-sentry:project-links:end -->
 
-一般使用者不需要安裝 Git 或 Python：
+一般使用者不需要另外安裝 Git 或 Python。發佈成品內含 python.org 官方 Windows 嵌入式 Python，程式原始碼與固定版本的相依套件保持為一般檔案，不使用 PyInstaller 或自製啟動器打包：
 
 1. 從 Releases 下載 `DeskSentry-<版本>-Setup.exe`。
 2. 執行安裝程式；預設安裝到 `%LOCALAPPDATA%\Programs\DeskSentry`，不需要系統管理員權限。
 3. 視需要保留或取消「開機時啟動」。之後也可在設定頁變更。
 
-需要免安裝版本時，下載 `DeskSentry-<版本>-portable.zip`，完整解壓後執行 `DeskSentry.exe`。可攜版不會自行加入開機啟動，但仍使用 `%APPDATA%\DeskSentry` 保存設定，並與安裝版共用單一執行個體及使用者資料。
+需要免安裝版本時，下載 `DeskSentry-<版本>-portable.zip`，完整解壓後執行 `啟動 Desk Sentry.cmd`。請保留整個資料夾；啟動腳本會以內附的官方 `pythonw.exe -m desk_sentry` 執行，不會留下黑色命令視窗。可攜版不會自行加入開機啟動，但仍使用 `%APPDATA%\DeskSentry` 保存設定，並與安裝版共用單一執行個體及使用者資料。
 
-安裝程式與程式碼目前尚未簽章。若 SmartScreen 顯示警告，請先確認檔案來自本專案 Releases，並以 PowerShell 核對 SHA-256：
+Inno Setup 安裝程式與專案程式碼目前尚未簽章；內附的 `python.exe`／`pythonw.exe` 則來自 python.org 官方嵌入式套件。若 SmartScreen 顯示警告，請先確認檔案來自本專案 Releases，並以 PowerShell 核對 SHA-256：
 
 ```powershell
 Get-FileHash .\DeskSentry-<版本>-Setup.exe -Algorithm SHA256
@@ -78,6 +78,16 @@ py -3.12 -m venv .venv
 開發與驗證方式見 [CONTRIBUTING.md](CONTRIBUTING.md)，發佈程序見 [RELEASING.md](RELEASING.md)，設計與資料流見 [DESIGN.md](DESIGN.md)。
 
 ## 常見問題
+
+### 開會時攝影機被佔用
+
+攝影機模式預設為「自動」：先嘗試 Windows 共用唯讀後端，讓其他程式控制攝影機；共用初始化失敗或數秒內沒有影格時，改用 DirectShow 相容後端。若驅動不支援共用，可選「相容模式（獨占）」。
+
+「開會時自動讓出攝影機」預設開啟。使用獨占後端時，程式每 2 秒在背景查看 Windows 的麥克風與攝影機使用紀錄；其他程式使用其中任一裝置時會釋放攝影機，顯示「已暫停 · 會議中（已讓出攝影機）」。使用紀錄連續清除 10 秒後才恢復，鎖定或非監看時段仍會維持暫停。共用後端成功時不會因會議自動讓出。
+
+Windows 使用紀錄不等於會議辨識：錄音工具等程式也可能觸發，且登錄紀錄可能延遲。若 Teams 仍拿不到畫面，可從系統匣選「暫時讓出攝影機」；看到已讓出後再開啟 Teams 攝影機，結束後手動選「恢復使用攝影機」。釋放完成前會顯示正在讓出，不會先宣稱已釋放。
+
+共用後端的攝影機索引依 Windows WinRT 視訊裝置列舉順序對應，相容後端依 OpenCV/DirectShow 索引；多攝影機環境的順序可能不同，請核對預覽並調整索引。實際是否能同時使用取決於 Windows、驅動與另一個程式；維護者可執行 `python tools/camera_share_probe.py` 驗證，探測只輸出影格計數與狀態，不儲存影像。
 
 ### 關閉更新檢查後，程式還會連網嗎？
 

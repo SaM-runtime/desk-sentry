@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
 import time
@@ -163,6 +164,10 @@ class Snapshot:
     health_reason: str | None = None
     evade_near: bool = False
     alert_ts: float | None = None
+    camera_backend: str = "exclusive"
+    # Acknowledged only after the camera's stop/release has completed.
+    pause_reason: str | None = None
+    pause_request: int = 0
 
 
 SnapshotCallback = Callable[[Snapshot], None]
@@ -229,7 +234,7 @@ class Engine:
         on_snapshot: SnapshotCallback,
         on_zone_calibrated: Callable[[Zone], None] | None = None,
         *,
-        camera_factory: Callable[[int], CameraSource] = Camera,
+        camera_factory: Callable[[int], CameraSource] | None = None,
         faces: FaceEmbedder | None = None,
         faces_loader: Callable[[], FaceEmbedder | None] | None = None,
     ) -> None:
@@ -242,15 +247,21 @@ class Engine:
         self._on_snapshot = on_snapshot
         self._on_zone = on_zone_calibrated
         self._camera_factory = camera_factory
+        self._camera_mode = settings.camera_mode
+        self._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
+        self._reported_backend: tuple[str, str | None] | None = None
         self._lock = threading.Lock()
         self._settings = settings
         self._pause_reason = "manual"
         self._current_pause_reason = "manual"
+        self._pause_request = 0
+        self._current_pause_request = 0
         self._dirty = True
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._camera: CameraSource | None = None
+        self._camera_closing = False
         self._tracker = Tracker()
         self._alerts = AlertEngine()
         # Converting frames for display costs CPU; skip it while nothing shows them.
@@ -275,9 +286,28 @@ class Engine:
 
     def _emit_snapshot(self, snapshot: Snapshot) -> None:
         self._update_health()
+        if self._camera is not None:
+            backend = getattr(self._camera, "backend_name", "exclusive")
+            self._camera_backend = backend if backend in ("shared", "exclusive") else "pending"
+            failure = getattr(self._camera, "failure_reason", None)
+            failure = (
+                failure
+                if isinstance(failure, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,95}", failure)
+                else None
+            )
+            record = (self._camera_backend, failure)
+            if self.diagnostics is not None and record != self._reported_backend:
+                self.diagnostics.write(
+                    "camera_backend", backend=record[0], failure_reason=record[1]
+                )
+                self._reported_backend = record
         self._on_snapshot(
             replace(
-                snapshot, health_state=self.health.state, health_reason=self.health.reason or None
+                snapshot,
+                health_state=self.health.state,
+                health_reason=self.health.reason or None,
+                camera_backend=self._camera_backend,
             )
         )
 
@@ -296,7 +326,7 @@ class Engine:
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join()
             self._thread = None
         self._close_camera()
         if self.diagnostics is not None:
@@ -311,19 +341,26 @@ class Engine:
     def set_people(self, people: PeopleSnapshot) -> None:
         self._people = people  # immutable snapshot; a reference swap is atomic
 
-    def apply(self, settings: Settings, *, pause_reason: str = "manual") -> None:
+    def apply(self, settings: Settings, *, pause_reason: str = "manual") -> int:
         with self._lock:
             self._settings = settings
             self._pause_reason = (
-                pause_reason if pause_reason in ("manual", "locked", "schedule") else "manual"
+                pause_reason
+                if pause_reason in ("manual", "locked", "schedule", "meeting", "manual_yield")
+                else "manual"
             )
             self._dirty = True
+            self._pause_request += 1
+            request = self._pause_request
         self._wake.set()
+        return request
 
     def _close_camera(self) -> None:
         if self._camera is not None:
+            self._camera_closing = True
             self._camera.stop()
             self._camera = None
+        self._camera_closing = False
         self._tracker.reset()
         self._alerts.reset()
 
@@ -331,6 +368,7 @@ class Engine:
         with self._lock:
             settings, dirty, self._dirty = self._settings, self._dirty, False
             self._current_pause_reason = self._pause_reason
+            self._current_pause_request = self._pause_request
         if dirty:
             if self._alerts.policy.self_zone != settings.self_zone:
                 self._alerts.reset()
@@ -342,7 +380,10 @@ class Engine:
                 alert_far_passersby=settings.alert_far_passersby,
                 unknown_level=Level(settings.unknown_level),
             )
-            if self._camera is not None and self._camera.index != settings.camera_index:
+            if self._camera is not None and (
+                self._camera.index != settings.camera_index
+                or self._camera_mode != settings.camera_mode
+            ):
                 self._close_camera()
         return settings
 
@@ -390,13 +431,18 @@ class Engine:
                 self._emit_snapshot(Snapshot(Status.ERROR))
             except Exception as exc:  # noqa: BLE001 - keep the sentry alive, report, retry
                 self._record_error(exc)
-                self._close_camera()
+                # Preserve ownership until stop confirms release. A stuck
+                # driver must not kill the worker or allow a second open.
+                with contextlib.suppress(Exception):
+                    self._close_camera()
                 state.reset()
                 self._emit_snapshot(Snapshot(Status.ERROR))
                 self._stop.wait(ERROR_RETRY_SECONDS)
 
     def _step(self, state: _LoopState) -> None:
         settings = self._sync_settings()
+        if self._camera_closing:
+            self._close_camera()
         log = self.diagnostics
         if not settings.armed:
             self.health.pause()
@@ -405,7 +451,11 @@ class Engine:
                 if log is not None:
                     log.write("paused", reason=self._current_pause_reason)
             self._emit_snapshot(
-                Snapshot(state.status_smoother.update(Status.PAUSED, time.monotonic()))
+                Snapshot(
+                    state.status_smoother.update(Status.PAUSED, time.monotonic()),
+                    pause_reason=self._current_pause_reason,
+                    pause_request=self._current_pause_request,
+                )
             )
             self._wake.wait(1.0)
             self._wake.clear()
@@ -414,7 +464,15 @@ class Engine:
         self.health.resume()
 
         if self._camera is None:
-            self._camera = self._camera_factory(settings.camera_index)
+            self._camera_mode = settings.camera_mode
+            self._camera = (
+                self._camera_factory(settings.camera_index)
+                if self._camera_factory is not None
+                else Camera(
+                    settings.camera_index,
+                    mode="exclusive" if settings.camera_mode == "exclusive" else "auto",
+                )
+            )
             self._camera.start()
             state.reset()
             if log is not None:

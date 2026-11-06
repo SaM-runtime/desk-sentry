@@ -74,6 +74,8 @@ SettingsCallback = Callable[[Settings], None]
 AppLister = Callable[[], list[tuple[str, str]]]  # (exe, example window title)
 
 _SENSITIVITY = [("low", "低"), ("medium", "中"), ("high", "高")]
+_CAMERA_MODES = [("auto", "自動（優先共用）"), ("exclusive", "相容模式（獨占）")]
+_AUTOMATIC_PAUSE_REASONS = ("locked", "schedule", "meeting", "manual_yield")
 _SENSITIVITY_HINT = {
     "low": "約 3 公尺內有人移動才提醒",
     "medium": "約 5 公尺內有人移動就提醒（建議）",
@@ -364,7 +366,7 @@ class _MainMirrorView(MirrorView):
         total_height = icon_size + theme.SPACE_12 + theme.NO_IMAGE_TITLE_HEIGHT
         top = outer.center().y() - total_height / 2
         icon = QRectF(outer.center().x() - icon_size / 2, top, icon_size, icon_size)
-        theme.neutral_icon().paint(painter, icon.toRect())
+        theme.app_icon().paint(painter, icon.toRect())
 
         font = QFont(self.font())
         font.setPixelSize(theme.FONT_BODY_PX)
@@ -439,8 +441,8 @@ class MainWindow(QMainWindow):
         self._drawer_animation: QParallelAnimationGroup | None = None
 
         self._last_status = Status.PAUSED
-        self.setWindowTitle("設定" if settings.discreet else "Desk Sentry 後照鏡")
-        self.setWindowIcon(theme.neutral_icon() if settings.discreet else theme.app_icon())
+        self.setWindowTitle("Desk Sentry 後照鏡")
+        self.setWindowIcon(theme.app_icon())
         self.resize(theme.D["main_default_width"], theme.D["main_default_height"])
         self.setMinimumSize(theme.D["main_min_width"], theme.D["main_min_height"])
         self._root = QWidget()
@@ -677,6 +679,29 @@ class MainWindow(QMainWindow):
         self.camera.setValue(s.camera_index)
         self.camera.valueChanged.connect(lambda value: self._update(camera_index=int(value)))
         detection.add_row(_setting_row("攝影機", self.camera, "內建是 0，外接是 1"))
+        self.camera_mode = _combo(_CAMERA_MODES, s.camera_mode)
+        self.camera_mode.currentIndexChanged.connect(
+            lambda _index: self._update(camera_mode=str(self.camera_mode.currentData()))
+        )
+        detection.add_row(
+            _setting_row(
+                "攝影機模式",
+                self.camera_mode,
+                "自動模式會先嘗試與視訊會議共用攝影機",
+            )
+        )
+        self.auto_yield_camera = Switch()
+        self.auto_yield_camera.setChecked(s.auto_yield_camera)
+        self.auto_yield_camera.toggled.connect(
+            lambda value: self._update(auto_yield_camera=bool(value))
+        )
+        detection.add_row(
+            _setting_row(
+                "開會時自動讓出攝影機",
+                self.auto_yield_camera,
+                "只有獨占攝影機時才會暫停監看",
+            )
+        )
         add_section("偵測", detection)
 
         yourself = _SettingsCard()
@@ -1312,14 +1337,12 @@ class MainWindow(QMainWindow):
             self._info_row.hide()
 
         icon = (
-            theme.neutral_icon()
-            if discreet
-            else theme.app_icon(theme.STATUS_COLOR[self._last_status])
+            theme.app_icon() if discreet else theme.app_icon(theme.STATUS_COLOR[self._last_status])
         )
         self._app_icon.setPixmap(icon.pixmap(theme.D["toolbar_icon"], theme.D["toolbar_icon"]))
         self.setWindowIcon(icon)
-        self.setWindowTitle("設定" if discreet else "Desk Sentry 後照鏡")
-        self._toolbar_title.setVisible(not discreet)
+        self.setWindowTitle("Desk Sentry 後照鏡")
+        self._toolbar_title.setVisible(True)
 
     def _sensitivity_changed(self, _index: int) -> None:
         value = str(self.sensitivity.currentData())
@@ -1661,6 +1684,7 @@ class MainWindow(QMainWindow):
         *,
         now: datetime | None = None,
         next_start: datetime | None = None,
+        acknowledged: bool = True,
     ) -> None:
         self._pause_reason = reason
         pause_copy = {
@@ -1668,6 +1692,13 @@ class MainWindow(QMainWindow):
             "schedule": "已暫停 · 非監看時段",
         }
         copy = pause_copy.get(reason) if reason is not None else None
+        if reason in ("meeting", "manual_yield"):
+            if not acknowledged:
+                copy = "正在讓出攝影機"
+            elif reason == "meeting":
+                copy = "已暫停 · 會議中（已讓出攝影機）"
+            else:
+                copy = "已暫停 · 已讓出攝影機"
         self.pause_reason.setText(copy or "")
         self.pause_reason.setVisible(copy is not None)
 
@@ -1688,11 +1719,13 @@ class MainWindow(QMainWindow):
                 if boundary.date() != current.date():
                     start_copy = f"週{_WEEKDAYS[boundary.weekday()]} {start_copy}"
                 automatic_detail = f"非監看時段 · {start_copy} 自動開始"
+        elif reason in ("meeting", "manual_yield"):
+            automatic_detail = copy
         self.mirror.set_automatic_pause_detail(automatic_detail)
         self._render_armed()
 
     def _resume_if_manual(self) -> None:
-        if self._pause_reason not in ("locked", "schedule"):
+        if self._pause_reason not in _AUTOMATIC_PAUSE_REASONS:
             self.toggle_armed()
 
     def toggle_armed(self) -> None:
@@ -1706,7 +1739,7 @@ class MainWindow(QMainWindow):
     def _render_armed(self) -> None:
         self.arm_button.set_armed(self._settings.armed)
         self.arm_button.set_automatic_pause(
-            self._settings.armed and self._pause_reason in ("locked", "schedule")
+            self._settings.armed and self._pause_reason in _AUTOMATIC_PAUSE_REASONS
         )
 
     def show_snapshot(self, snap: Snapshot) -> None:
@@ -1743,7 +1776,7 @@ class MainWindow(QMainWindow):
         self._status_title.setText(title)
         self._status_detail.setText(detail)
         icon = (
-            theme.neutral_icon()
+            theme.app_icon()
             if self._settings.discreet
             else theme.app_icon(theme.STATUS_COLOR[snap.status])
         )

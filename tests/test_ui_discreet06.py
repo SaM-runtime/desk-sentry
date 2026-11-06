@@ -155,14 +155,16 @@ def test_discreet_stage_drops_live_and_cached_images_until_a_new_normal_frame(qt
     assert window._info_row.isVisibleTo(window)
 
 
-def test_discreet_window_uses_neutral_title_and_icon_then_restores_identity(qtbot: QtBot) -> None:
+def test_discreet_window_uses_neutral_title_and_fixed_icon_then_restores_identity(
+    qtbot: QtBot,
+) -> None:
     window = _window(qtbot, Settings(discreet=True))
-    neutral = theme.neutral_icon().pixmap(32, 32).toImage()
+    neutral = theme.app_icon().pixmap(32, 32).toImage()
     paused_branded = theme.app_icon(theme.STATUS_COLOR[Status.PAUSED]).pixmap(32, 32).toImage()
 
     assert neutral != paused_branded
-    assert window.windowTitle() == "設定"
-    assert not window._toolbar_title.isVisible()
+    assert window.windowTitle() == "Desk Sentry 後照鏡"
+    assert window._toolbar_title.isVisibleTo(window)
     assert window.windowIcon().pixmap(32, 32).toImage() == neutral
     window.show_snapshot(_snapshot(Status.ALERT))
     assert window.windowIcon().pixmap(32, 32).toImage() == neutral

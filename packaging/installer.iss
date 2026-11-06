@@ -22,8 +22,9 @@ UsePreviousAppDir=no
 DefaultGroupName=Desk Sentry
 PrivilegesRequired=lowest
 AppMutex=DeskSentry.SingleInstance
-CloseApplications=yes
-CloseApplicationsFilter=DeskSentry.exe
+; pythonw.exe may also belong to unrelated applications. Graceful shutdown is
+; requested through Desk Sentry's own IPC below, then guarded by AppMutex.
+CloseApplications=no
 RestartApplications=no
 OutputDir={#MyOutputDir}
 OutputBaseFilename=DeskSentry-{#MyAppVersion}-Setup
@@ -31,12 +32,15 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=desk_sentry.ico
-UninstallDisplayIcon={app}\DeskSentry.exe
+UninstallDisplayIcon={app}\desk_sentry.ico
 
 [InstallDelete]
 ; A release replaces any developer deployment; drop its commit marker so
 ; tools/deploy.ps1 does not mistake this install for the checked-out HEAD.
 Type: files; Name: "{app}\VERSION.txt"
+; Remove only the obsolete PyInstaller files from releases before 2.0.1.
+Type: files; Name: "{app}\DeskSentry.exe"
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "{#MySourceDir}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -46,15 +50,15 @@ Source: "{#MySourceDir}\*"; DestDir: "{app}"; Excludes: "THIRD_PARTY_NOTICES.md"
 Name: "startup"; Description: "Start Desk Sentry when I sign in"
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DeskSentry"; ValueData: """{app}\DeskSentry.exe"" --minimized"; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DeskSentry"; ValueData: """{app}\python\pythonw.exe"" -m desk_sentry --minimized"; Tasks: startup
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "DeskSentry"; Check: StartupNotSelected; Flags: deletevalue
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "DeskSentry"; Flags: uninsdeletevalue
 
 [Icons]
-Name: "{userprograms}\Desk Sentry"; Filename: "{app}\DeskSentry.exe"
+Name: "{userprograms}\Desk Sentry"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m desk_sentry"; WorkingDir: "{app}"; IconFilename: "{app}\desk_sentry.ico"
 
 [Run]
-Filename: "{app}\DeskSentry.exe"; Parameters: "--minimized"; Description: "Start Desk Sentry"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\python\pythonw.exe"; Parameters: "-m desk_sentry --minimized"; WorkingDir: "{app}"; Description: "Start Desk Sentry"; Flags: nowait postinstall skipifsilent
 
 [Code]
 const
@@ -62,7 +66,9 @@ const
 
 function InstalledExecutable: String;
 begin
-  Result := ExpandConstant('{localappdata}\Programs\DeskSentry\DeskSentry.exe');
+  Result := ExpandConstant('{localappdata}\Programs\DeskSentry\python\pythonw.exe');
+  if not FileExists(Result) then
+    Result := ExpandConstant('{localappdata}\Programs\DeskSentry\DeskSentry.exe');
 end;
 
 procedure RequestGracefulQuit;
@@ -75,9 +81,16 @@ begin
   if FileExists(Executable) then
   begin
     Log('Requesting graceful Desk Sentry shutdown before file replacement.');
-    if not Exec(Executable, '--quit', ExtractFileDir(Executable), SW_HIDE,
+    if CompareText(ExtractFileName(Executable), 'pythonw.exe') = 0 then
+    begin
+      if not Exec(Executable, '-m desk_sentry --quit',
+        ExpandConstant('{localappdata}\Programs\DeskSentry'), SW_HIDE,
+        ewWaitUntilTerminated, ResultCode) then
+        Log('Could not request Desk Sentry shutdown: ' + SysErrorMessage(ResultCode));
+    end
+    else if not Exec(Executable, '--quit', ExtractFileDir(Executable), SW_HIDE,
       ewWaitUntilTerminated, ResultCode) then
-      Log('Could not launch DeskSentry.exe --quit: ' + SysErrorMessage(ResultCode));
+      Log('Could not request Desk Sentry shutdown: ' + SysErrorMessage(ResultCode));
   end;
 
   { Inno Pascal Script has no GetTickCount: count 100 ms polls, up to 10 s. }

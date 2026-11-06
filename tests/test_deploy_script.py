@@ -82,25 +82,32 @@ def _wait_for_file(path: Path, timeout: float = 5.0) -> bool:
     return path.exists()
 
 
-def _install_fake_pyinstaller(repo: Path, test_env: dict[str, str]) -> None:
-    package = repo / "fake-modules" / "PyInstaller"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "__main__.py").write_text(
+def _write_embedded_python(install_dir: Path, content: bytes = b"installed") -> Path:
+    pythonw = install_dir / "python" / "pythonw.exe"
+    pythonw.parent.mkdir(parents=True, exist_ok=True)
+    pythonw.write_bytes(content)
+    return pythonw
+
+
+def _install_fake_bundle_builder(repo: Path) -> None:
+    (repo / "packaging" / "build_release.py").write_text(
         """\
 import pathlib
 import json
 import subprocess
 import sys
 
-dist = pathlib.Path(sys.argv[sys.argv.index("--distpath") + 1])
-output = dist / "DeskSentry"
-output.mkdir(parents=True, exist_ok=True)
-(output / "DeskSentry.exe").write_bytes(b"new executable")
+if sys.argv[1] != "bundle":
+    raise SystemExit(2)
+output = pathlib.Path(sys.argv[sys.argv.index("--output") + 1])
+output.mkdir(parents=True)
+(output / "python").mkdir()
+(output / "python" / "python.exe").write_bytes(b"official python fixture")
+(output / "python" / "pythonw.exe").write_bytes(b"official pythonw fixture")
 head = subprocess.run(
     ["git", "rev-parse", "HEAD"], capture_output=True, check=True, text=True
 ).stdout.strip()
-build_info = output / "_internal" / "desk_sentry" / "_build_info.json"
+build_info = output / "app" / "desk_sentry" / "_build_info.json"
 build_info.parent.mkdir(parents=True, exist_ok=True)
 build_info.write_text(
     json.dumps(
@@ -118,7 +125,6 @@ build_info.write_text(
 """,
         encoding="utf-8",
     )
-    test_env["PYTHONPATH"] = str(repo / "fake-modules")
 
 
 @pytest.fixture
@@ -151,7 +157,7 @@ def deploy_repo(tmp_path: Path) -> Iterator[tuple[Path, Path, dict[str, str]]]:
     shutil.copy2(Path(sys.executable), repo / ".venv" / "Scripts" / "python.exe")
     shutil.copy2(venv_config, repo / ".venv" / "pyvenv.cfg")
     (repo / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (repo / "packaging" / "DeskSentry.spec").write_text("# fixture spec\n", encoding="utf-8")
+    _install_fake_bundle_builder(repo)
     (repo / "pyproject.toml").write_text("[project]\nname = 'fixture'\n", encoding="utf-8")
     (repo / "licenses" / "NOTICE.txt").write_text("fixture\n", encoding="utf-8")
     for model_name in MODEL_NAMES:
@@ -182,7 +188,7 @@ def test_dry_run_same_version_skips(
 ) -> None:
     repo, install_dir, test_env = deploy_repo
     install_dir.mkdir()
-    (install_dir / "DeskSentry.exe").write_bytes(b"installed")
+    _write_embedded_python(install_dir)
     head = _run_git(repo, "rev-parse", "HEAD").stdout.strip()
     version_file = install_dir / "VERSION.txt"
     original_version = f"{head}\nold deployment time\n"
@@ -203,7 +209,7 @@ def test_dry_run_new_version_format_uses_full_hash_on_second_line(
 ) -> None:
     repo, install_dir, test_env = deploy_repo
     install_dir.mkdir()
-    (install_dir / "DeskSentry.exe").write_bytes(b"installed")
+    _write_embedded_python(install_dir)
     head = _run_git(repo, "rev-parse", "HEAD").stdout.strip()
     (install_dir / "VERSION.txt").write_text(
         f"2.0.0+{head[:7]}\n{head}\n2026-10-20T08:00:00Z\n",
@@ -232,6 +238,8 @@ def test_force_dry_run_lists_every_deployment_step(
     ]
     assert positions == sorted(positions)
     assert "--quit" in output and "CloseMainWindow/force fallback" in output
+    assert "build_release.py bundle" in output
+    assert 'python\\pythonw.exe" -m desk_sentry --minimized' in output
     assert not install_dir.exists()
     assert not (repo / ".tmp" / "deploy").exists()
 
@@ -277,7 +285,7 @@ def test_build_failure_preserves_installed_version(
     (install_dir / "VERSION.txt").write_text("old-head\nold deployment time\n", encoding="utf-8")
     before = {path.name: path.read_bytes() for path in install_dir.iterdir()}
 
-    # cmd.exe is a real executable but cannot satisfy ``python -m PyInstaller``.
+    # cmd.exe is a real executable but cannot run the Python bundle builder.
     shutil.copy2(Path(os.environ["COMSPEC"]), repo / ".venv" / "Scripts" / "python.exe")
     result = _run_deploy(
         repo,
@@ -357,7 +365,7 @@ def test_swap_copy_failure_restores_existing_installation(
     (install_dir / "unins000.exe").write_bytes(b"existing uninstaller")
     (install_dir / "unins000.dat").write_bytes(b"existing uninstall metadata")
     before = {path.name: path.read_bytes() for path in install_dir.iterdir()}
-    _install_fake_pyinstaller(repo, test_env)
+    _install_fake_bundle_builder(repo)
     wrapper_env = test_env.copy()
     wrapper_env["TEST_DEPLOY_SCRIPT"] = str(repo / "tools" / "deploy.ps1")
     wrapper_env["TEST_INSTALL_DIR"] = str(install_dir)
@@ -407,7 +415,7 @@ def test_deploy_preserves_inno_owned_files_across_two_swaps(deploy_repo):
     for name, content in original.items():
         (install_dir / name).write_bytes(content)
     (install_dir / "DeskSentry.exe").write_bytes(b"old executable")
-    _install_fake_pyinstaller(repo, test_env)
+    _install_fake_bundle_builder(repo)
     wrapper_env = test_env | {
         "TEST_DEPLOY_SCRIPT": str(repo / "tools/deploy.ps1"),
         "TEST_INSTALL_DIR": str(install_dir),
@@ -442,17 +450,16 @@ def test_deploy_requests_graceful_quit_before_wait_and_fallback(
 ) -> None:
     repo, install_dir, test_env = deploy_repo
     install_dir.mkdir()
-    installed_exe = install_dir / "DeskSentry.exe"
-    installed_exe.write_bytes(b"existing executable")
+    installed_exe = _write_embedded_python(install_dir, b"existing official pythonw fixture")
     (install_dir / "VERSION.txt").write_text("old-head\nold time\n", encoding="utf-8")
-    _install_fake_pyinstaller(repo, test_env)
+    _install_fake_bundle_builder(repo)
     marker = repo.parent / "process-sequence.txt"
     wrapper_env = test_env.copy()
     wrapper_env["TEST_DEPLOY_SCRIPT"] = str(repo / "tools" / "deploy.ps1")
     wrapper_env["TEST_INSTALL_DIR"] = str(install_dir)
     wrapper_env["TEST_PROCESS_MARKER"] = str(marker)
     wrapper_env["TEST_MATCHING_EXE"] = str(installed_exe)
-    wrapper_env["TEST_OTHER_EXE"] = str(repo.parent / "other" / "DeskSentry.exe")
+    wrapper_env["TEST_OTHER_EXE"] = str(repo.parent / "other" / "pythonw.exe")
 
     result = subprocess.run(
         [
@@ -463,8 +470,10 @@ def test_deploy_requests_graceful_quit_before_wait_and_fallback(
             "-Command",
             (
                 "function global:Get-CimInstance { @("
-                "[pscustomobject]@{ProcessId=11;ExecutablePath=$env:TEST_MATCHING_EXE},"
-                "[pscustomobject]@{ProcessId=22;ExecutablePath=$env:TEST_OTHER_EXE}) }; "
+                "[pscustomobject]@{ProcessId=11;ExecutablePath=$env:TEST_MATCHING_EXE;"
+                "CommandLine='pythonw.exe -m desk_sentry'},"
+                "[pscustomobject]@{ProcessId=22;ExecutablePath=$env:TEST_OTHER_EXE;"
+                "CommandLine='pythonw.exe -m desk_sentry'}) }; "
                 "function global:Get-Process { param([int]$Id,[object]$ErrorAction); "
                 'if ($Id -ne 11) { throw "unexpected process lookup $Id" }; '
                 "$p=[pscustomobject]@{Id=$Id;Path=$env:TEST_MATCHING_EXE}; "
@@ -497,7 +506,7 @@ def test_deploy_requests_graceful_quit_before_wait_and_fallback(
     assert result.returncode == 0, output
     events = marker.read_text(encoding="utf-8-sig").splitlines()
     assert events == [
-        f"start:{installed_exe}:--quit",
+        f"start:{installed_exe}:-m desk_sentry --quit",
         "wait:11:10000",
         "close:11",
         "wait:11:1000",
@@ -506,7 +515,7 @@ def test_deploy_requests_graceful_quit_before_wait_and_fallback(
     ]
     version_lines = (install_dir / "VERSION.txt").read_text(encoding="utf-8-sig").splitlines()
     staged_info = json.loads(
-        (install_dir / "_internal" / "desk_sentry" / "_build_info.json").read_text(encoding="utf-8")
+        (install_dir / "app" / "desk_sentry" / "_build_info.json").read_text(encoding="utf-8")
     )
     assert version_lines[0] == staged_info["display_version"]
     assert version_lines[1] == _run_git(repo, "rev-parse", "HEAD").stdout.strip()

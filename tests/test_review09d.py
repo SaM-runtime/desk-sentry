@@ -1,7 +1,6 @@
 """Release path and synchronous, idempotent shutdown regression contracts."""
 
 import ctypes
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,34 +13,18 @@ from test_app_review05c import local_app as local_app
 from test_packaging09 import _load_helper
 
 
-def test_spec_resolves_relative_metadata_against_project_in_every_cwd(tmp_path, monkeypatch):
+def test_metadata_resolves_relative_path_against_project_in_every_cwd(tmp_path, monkeypatch):
+    helper = _load_helper()
     project = tmp_path / "project"
     other = tmp_path / "outside"
-    (project / "packaging").mkdir(parents=True)
+    project.mkdir()
     other.mkdir()
-    root = Path(__file__).resolve().parents[1]
-    helper = _load_helper()
-    monkeypatch.setitem(sys.modules, "build_release", helper)
-    monkeypatch.setattr(sys, "path", [str(root / "packaging"), *sys.path])
-    monkeypatch.setenv("DESKSENTRY_METADATA_DIR", ".tmp/release")
-    prefix = (
-        (root / "packaging/DeskSentry.spec").read_text(encoding="utf-8").split("a = Analysis(")[0]
-    )
-    observed = []
     for cwd in (project, other):
         monkeypatch.chdir(cwd)
-        namespace = {"SPEC": str(project / "packaging/DeskSentry.spec")}
-        exec(compile(prefix, "DeskSentry.spec", "exec"), namespace)
-        directory = namespace["METADATA_DIR"]
-        assert directory.is_absolute()
-        assert directory == project / ".tmp/release"
-        assert namespace["BUILD_INFO"] == directory / "_build_info.json"
-        assert namespace["VERSION_INFO"] == directory / "version-info.txt"
-        assert namespace["BUILD_INFO"].is_file()
-        assert namespace["VERSION_INFO"].is_file()
-        observed.append(directory)
-    assert observed[0] == observed[1]
-    assert not (other / ".tmp").exists()
+        assert (
+            helper.resolve_metadata_dir(Path(".tmp/release"), root=project)
+            == project / ".tmp/release"
+        )
 
 
 @pytest.mark.parametrize("diagnostics", [True, False])

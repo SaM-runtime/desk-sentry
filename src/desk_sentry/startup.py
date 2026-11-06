@@ -11,8 +11,8 @@ VALUE_NAME = "DeskSentry"
 
 
 def launch_command() -> str:
-    if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" --minimized'
+    """Return the module launch used by source and embedded-Python installs."""
+
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     interpreter = pythonw if pythonw.is_file() else Path(sys.executable)
     return f'"{interpreter}" -m desk_sentry --minimized'

@@ -75,8 +75,16 @@ function Remove-InstallDirectory([string]$Path) {
 }
 
 function Stop-InstalledProcesses {
-    $allowedPaths = @($installedExe, $legacyExe)
-    $candidates = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'DeskSentry.exe'")
+    $allowedPaths = @($installedPythonw, $installedLegacyExe, $projectLegacyExe)
+    $candidates = @(
+        Get-CimInstance -ClassName Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'DeskSentry.exe'" |
+            Where-Object {
+                $_.ExecutablePath -and $allowedPaths -icontains $_.ExecutablePath -and
+                ((Test-SamePath $_.ExecutablePath $installedLegacyExe) -or
+                    (Test-SamePath $_.ExecutablePath $projectLegacyExe) -or
+                    $_.CommandLine -match '(?i)(?:^|\s)-m\s+desk_sentry(?:\s|$)')
+            }
+    )
     $targets = @()
     foreach ($candidate in $candidates) {
         if (-not $candidate.ExecutablePath -or $allowedPaths -inotcontains $candidate.ExecutablePath) { continue }
@@ -90,10 +98,19 @@ function Stop-InstalledProcesses {
         Write-Step 'stop' 'complete (no matching executable paths)'
         return
     }
-    $quitExe = if (Test-Path -LiteralPath $installedExe -PathType Leaf) { $installedExe } else { $legacyExe }
+    $quitExe = if (Test-Path -LiteralPath $installedPythonw -PathType Leaf) {
+        $installedPythonw
+    }
+    elseif (Test-Path -LiteralPath $installedLegacyExe -PathType Leaf) {
+        $installedLegacyExe
+    }
+    else {
+        $projectLegacyExe
+    }
     if (Test-Path -LiteralPath $quitExe -PathType Leaf) {
-        Write-Step 'stop' "notify graceful quit: $quitExe --quit"
-        Start-Process -FilePath $quitExe -ArgumentList '--quit' -WorkingDirectory (Split-Path $quitExe -Parent) -WindowStyle Hidden
+        $quitArguments = if (Test-SamePath $quitExe $installedPythonw) { '-m desk_sentry --quit' } else { '--quit' }
+        Write-Step 'stop' "notify graceful quit: $quitExe $quitArguments"
+        Start-Process -FilePath $quitExe -ArgumentList $quitArguments -WorkingDirectory $InstallDir -WindowStyle Hidden
     }
     foreach ($target in $targets) {
         $process = Get-Process -Id $target.Id -ErrorAction SilentlyContinue
@@ -126,12 +143,13 @@ try {
     }
     $previousDir = "$InstallDir.prev"
     $stagingDir = Join-Path $projectRoot '.tmp\deploy\dist\DeskSentry'
-    $installedExe = Join-Path $InstallDir 'DeskSentry.exe'
-    $legacyExe = Join-Path $projectRoot 'dist\DeskSentry\DeskSentry.exe'
+    $installedPythonw = Join-Path $InstallDir 'python\pythonw.exe'
+    $installedLegacyExe = Join-Path $InstallDir 'DeskSentry.exe'
+    $projectLegacyExe = Join-Path $projectRoot 'dist\DeskSentry\DeskSentry.exe'
     if ((Test-Within $projectRoot $InstallDir) -or (Test-Within $projectRoot $previousDir)) {
         throw 'InstallDir must not contain the project'
     }
-    foreach ($protected in @('src', 'packaging', 'models', 'licenses', 'tools', 'tests', '.venv', '.git', '.agents', ('.' + 'codex'), ('.' + 'console'), ('.' + 'task'), 'dist', '.tmp\deploy\dist', '.tmp\deploy\build')) {
+    foreach ($protected in @('src', 'packaging', 'models', 'licenses', 'tools', 'tests', '.venv', '.git', '.agents', ('.' + 'codex'), ('.' + 'console'), ('.' + 'task'), 'dist', '.tmp\deploy\dist', '.tmp\deploy\metadata')) {
         $protectedPath = Join-Path $projectRoot $protected
         if ((Test-Within $InstallDir $protectedPath) -or (Test-Within $protectedPath $InstallDir) -or
             (Test-Within $previousDir $protectedPath) -or (Test-Within $protectedPath $previousDir)) {
@@ -173,27 +191,31 @@ try {
                 $installedHash = $versionLines[0]
             }
         }
-        if (-not $Force -and $installedHash -eq $head -and (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
+        if (-not $Force -and $installedHash -eq $head -and (Test-Path -LiteralPath $installedPythonw -PathType Leaf)) {
             Write-Step 'version' 'same HEAD，跳過 (already installed)'
         }
         else {
             $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
-            Write-Step 'build' "$python -m PyInstaller --noconfirm packaging\DeskSentry.spec --distpath .tmp\deploy\dist --workpath .tmp\deploy\build"
+            $metadataDir = Join-Path $projectRoot '.tmp\deploy\metadata'
+            Write-Step 'build' "$python packaging\build_release.py bundle --output $stagingDir --metadata-dir $metadataDir"
             if (-not $DryRun) {
                 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw "Missing build Python: $python" }
-                # Native build output is timestamped and retained in deploy.log as well.
-                # Windows PowerShell wraps native stderr in ErrorRecords; PyInstaller
-                # writes progress there even on success. Judge the native exit code.
+                # bundle publishes by atomically renaming into a path that must not exist.
+                Assert-PlainDirectory $stagingDir
+                if (Test-Path -LiteralPath $stagingDir) {
+                    Remove-Item -LiteralPath $stagingDir -Recurse -Force
+                }
+                # Native build output is retained in deploy.log; judge its exit code.
                 $ErrorActionPreference = 'Continue'
                 try {
-                    & $python -m PyInstaller --noconfirm packaging\DeskSentry.spec --distpath .tmp\deploy\dist --workpath .tmp\deploy\build 2>&1 |
+                    & $python packaging\build_release.py bundle --output $stagingDir --metadata-dir $metadataDir 2>&1 |
                         ForEach-Object { Write-Step 'build-output' "$_" }
                     $buildExitCode = $LASTEXITCODE
                 }
                 finally { $ErrorActionPreference = 'Stop' }
                 if ($buildExitCode -ne 0) { throw "Build failed, exit $buildExitCode; installed version untouched" }
-                if (-not (Test-Path -LiteralPath (Join-Path $stagingDir 'DeskSentry.exe') -PathType Leaf)) { throw 'Build produced no DeskSentry.exe' }
-                $buildInfoPath = Join-Path $stagingDir '_internal\desk_sentry\_build_info.json'
+                if (-not (Test-Path -LiteralPath (Join-Path $stagingDir 'python\pythonw.exe') -PathType Leaf)) { throw 'Bundle produced no python\pythonw.exe' }
+                $buildInfoPath = Join-Path $stagingDir 'app\desk_sentry\_build_info.json'
                 if (-not (Test-Path -LiteralPath $buildInfoPath -PathType Leaf)) { throw 'Build produced no _build_info.json' }
                 try { $stagedBuildInfo = Get-Content -LiteralPath $buildInfoPath -Encoding UTF8 -Raw | ConvertFrom-Json }
                 catch { throw "Invalid staged _build_info.json: $($_.Exception.Message)" }
@@ -204,7 +226,7 @@ try {
                 }
                 Write-Step 'build' 'success; installed version still untouched'
             }
-            Write-Step 'stop' "run --quit, wait 10s, then CloseMainWindow/force fallback only $installedExe or $legacyExe"
+            Write-Step 'stop' 'run -m desk_sentry --quit, then CloseMainWindow/force fallback only for exact Desk Sentry paths'
             if (-not $DryRun) { Stop-InstalledProcesses }
             Write-Step 'swap' "$InstallDir -> $previousDir; copy $stagingDir; write VERSION.txt"
             if (-not $DryRun) {
@@ -240,7 +262,7 @@ try {
                     throw
                 }
             }
-            $command = '"{0}" --minimized' -f $installedExe
+            $command = '"{0}" -m desk_sentry --minimized' -f $installedPythonw
             if ($SkipRegistry) { Write-Step 'registry' 'skip (-SkipRegistry)' }
             else {
                 Write-Step 'registry' "HKCU Run DeskSentry = $command"
@@ -253,7 +275,7 @@ try {
             if ($NoStart) { Write-Step 'start' 'skip (-NoStart)' }
             else {
                 Write-Step 'start' $command
-                if (-not $DryRun) { Start-Process -FilePath $installedExe -ArgumentList '--minimized' -WorkingDirectory $InstallDir -WindowStyle Hidden }
+                if (-not $DryRun) { Start-Process -FilePath $installedPythonw -ArgumentList '-m desk_sentry --minimized' -WorkingDirectory $InstallDir -WindowStyle Hidden }
             }
             if ($DryRun) { Write-Step 'complete' "plan only for $head (no changes)" }
             else { Write-Step 'complete' "deployed $head" }

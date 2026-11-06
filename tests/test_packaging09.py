@@ -17,8 +17,8 @@ from desk_sentry.project import GITHUB_REPOSITORY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HELPER_PATH = PROJECT_ROOT / "packaging" / "build_release.py"
-SPEC_PATH = PROJECT_ROOT / "packaging" / "DeskSentry.spec"
 INSTALLER_PATH = PROJECT_ROOT / "packaging" / "installer.iss"
+RELEASE_WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "release.yml"
 
 
 def _load_helper() -> ModuleType:
@@ -30,9 +30,8 @@ def _load_helper() -> ModuleType:
     return module
 
 
-def test_prepare_metadata_generates_version_resource_and_project_defines(tmp_path: Path) -> None:
+def test_prepare_metadata_generates_build_info_and_project_defines(tmp_path: Path) -> None:
     helper = _load_helper()
-    numeric = tuple(int(part) for part in desk_sentry.__version__.split(".")) + (0,)
 
     metadata = helper.prepare_metadata(tmp_path, release=True, root=PROJECT_ROOT)
 
@@ -42,11 +41,7 @@ def test_prepare_metadata_generates_version_resource_and_project_defines(tmp_pat
     assert persisted == metadata
     build_info = json.loads((tmp_path / "_build_info.json").read_text(encoding="utf-8"))
     assert build_info["display_version"] == desk_sentry.__version__
-    version_info = (tmp_path / "version-info.txt").read_text(encoding="utf-8")
-    assert f"filevers={numeric!r}" in version_info
-    assert f"prodvers={numeric!r}" in version_info
-    assert f"StringStruct('FileVersion', '{desk_sentry.__version__}')" in version_info
-    assert f"StringStruct('ProductVersion', '{desk_sentry.__version__}')" in version_info
+    assert not (tmp_path / "version-info.txt").exists()
     defines = (tmp_path / "installer-defines.iss").read_text(encoding="utf-8")
     assert f'#define MyAppVersion "{desk_sentry.__version__}"' in defines
     assert f'#define MyRepositoryUrl "https://github.com/{GITHUB_REPOSITORY}"' in defines
@@ -120,9 +115,11 @@ def test_prepare_cli_uses_release_environment_switch(tmp_path: Path) -> None:
 def test_package_creates_portable_zip_checksums_and_release_notes(tmp_path: Path) -> None:
     helper = _load_helper()
     distribution = tmp_path / "dist" / "DeskSentry"
-    (distribution / "_internal").mkdir(parents=True)
-    (distribution / "DeskSentry.exe").write_bytes(b"portable exe")
-    (distribution / "_internal" / "runtime.bin").write_bytes(b"runtime")
+    (distribution / "python").mkdir(parents=True)
+    (distribution / "python" / "python.exe").write_bytes(b"official python")
+    (distribution / "python" / "pythonw.exe").write_bytes(b"official pythonw")
+    (distribution / "app" / "desk_sentry").mkdir(parents=True)
+    (distribution / "app" / "desk_sentry" / "__init__.py").write_text("", encoding="utf-8")
     (distribution / "THIRD_PARTY_NOTICES.md").write_text(
         "fixture notices\n", encoding="utf-8", newline="\n"
     )
@@ -142,9 +139,10 @@ def test_package_creates_portable_zip_checksums_and_release_notes(tmp_path: Path
     portable = output / f"DeskSentry-{desk_sentry.__version__}-portable.zip"
     with zipfile.ZipFile(portable) as archive:
         assert archive.namelist() == [
-            "DeskSentry/DeskSentry.exe",
             "DeskSentry/THIRD_PARTY_NOTICES.md",
-            "DeskSentry/_internal/runtime.bin",
+            "DeskSentry/app/desk_sentry/__init__.py",
+            "DeskSentry/python/python.exe",
+            "DeskSentry/python/pythonw.exe",
         ]
         assert archive.read("DeskSentry/THIRD_PARTY_NOTICES.md") == b"fixture notices\n"
     notes = (output / "release-notes.md").read_text(encoding="utf-8")
@@ -161,7 +159,8 @@ def test_release_packaging_rejects_missing_notices_and_installer_requires_them(t
     helper = _load_helper()
     distribution = tmp_path / "dist"
     distribution.mkdir()
-    (distribution / "DeskSentry.exe").write_bytes(b"fixture")
+    (distribution / "python").mkdir()
+    (distribution / "python" / "pythonw.exe").write_bytes(b"fixture")
     installer = tmp_path / "Setup.exe"
     installer.write_bytes(b"fixture")
     with pytest.raises(ValueError, match="THIRD_PARTY_NOTICES.md"):
@@ -187,20 +186,6 @@ def test_project_links_managed_block_is_derived_from_repository_constant(tmp_pat
     assert helper.check_project_links(readme) is True
 
 
-def test_spec_bundles_build_info_and_network_runtime_with_version_resource() -> None:
-    spec = SPEC_PATH.read_text(encoding="utf-8")
-
-    assert "prepare_metadata" in spec
-    assert '"desk_sentry"' in spec and '"_build_info.json"' in spec
-    assert "version=str(" in spec
-    excludes = spec[spec.index("excludes=") : spec.index("noarchive=")]
-    for required in ('"ssl"', '"_ssl"', '"urllib.request"'):
-        assert required not in excludes
-    drop_list = spec[spec.index("_DROP =") : spec.index("def _keep")]
-    assert "libcrypto" not in drop_list
-    assert "libssl" not in drop_list
-
-
 def test_installer_enforces_fixed_location_startup_and_safe_uninstall() -> None:
     installer = INSTALLER_PATH.read_text(encoding="utf-8")
 
@@ -211,14 +196,16 @@ def test_installer_enforces_fixed_location_startup_and_safe_uninstall() -> None:
         "DisableDirPage=yes",
         "UsePreviousAppDir=no",
         "AppMutex=DeskSentry.SingleInstance",
-        "CloseApplications=yes",
+        "CloseApplications=no",
         'ValueName: "DeskSentry"',
-        r'ValueData: """{app}\DeskSentry.exe"" --minimized"',
+        r'ValueData: """{app}\python\pythonw.exe"" -m desk_sentry --minimized"',
         "uninsdeletevalue",
         "deletevalue",
         r"{userappdata}\DeskSentry",
         "UninstallSilent",
         r'Type: files; Name: "{app}\VERSION.txt"',
+        r'Type: files; Name: "{app}\DeskSentry.exe"',
+        r'Type: filesandordirs; Name: "{app}\_internal"',
     )
     for value in required:
         assert value in installer
@@ -232,13 +219,30 @@ def test_installer_enforces_fixed_location_startup_and_safe_uninstall() -> None:
         if "ValueType: none" in line and "uninsdeletevalue" in line
     )
     assert "Tasks:" not in unconditional_cleanup and "Check:" not in unconditional_cleanup
+    assert "CloseApplicationsFilter" not in installer
+    assert r"UninstallDisplayIcon={app}\desk_sentry.ico" in installer
+    shortcut = next(
+        line for line in installer.splitlines() if line.startswith('Name: "{userprograms}')
+    )
+    assert r'Filename: "{app}\python\pythonw.exe"' in shortcut
+    assert 'Parameters: "-m desk_sentry"' in shortcut
+    assert r'IconFilename: "{app}\desk_sentry.ico"' in shortcut
     request = installer.index("procedure RequestGracefulQuit")
-    quit_command = installer.index("'--quit'", request)
+    quit_command = installer.index("'-m desk_sentry --quit'", request)
     mutex_wait = installer.index("CheckForMutexes('DeskSentry.SingleInstance')", request)
     assert quit_command < mutex_wait
     initialize = installer.index("function InitializeSetup")
     assert "RequestGracefulQuit;" in installer[initialize : initialize + 300]
+    assert r"{localappdata}\Programs\DeskSentry\python\pythonw.exe" in installer
     assert r"{localappdata}\Programs\DeskSentry\DeskSentry.exe" in installer
+
+
+def test_release_workflow_builds_unpacked_bundle_without_pyinstaller() -> None:
+    workflow = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+    assert "build_release.py bundle" in workflow
+    assert "--output .tmp/release/dist/DeskSentry" in workflow
+    assert "--metadata-dir .tmp/release" in workflow
+    assert "PyInstaller" not in workflow
 
 
 def test_notice_model_license_references_exist():
@@ -247,7 +251,7 @@ def test_notice_model_license_references_exist():
 
     root = Path(__file__).resolve().parents[1]
     notice = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-    paths = re.findall(r"`(?:_internal/)?(licenses/[^`]+)`", notice)
+    paths = re.findall(r"`(licenses/[^`]+)`", notice)
     assert len(paths) >= 3
     for path in paths:
         assert (root / path).is_file(), path

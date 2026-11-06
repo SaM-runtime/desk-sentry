@@ -37,8 +37,8 @@ jobs:
           path: models/*.onnx
           key: models-${{ runner.os }}-${{ hashFiles('tools/fetch_model.py') }}
 
-      - name: Install project, test tools, and PyInstaller
-        run: .\.venv\Scripts\python.exe -m pip install -e ".[dev]" "PyInstaller==6.21.0"
+      - name: Install project and test tools
+        run: .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
       - name: Export canonical repository identity
         shell: pwsh

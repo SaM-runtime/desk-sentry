@@ -144,9 +144,7 @@ def test_manual_button_with_auto_off_download_skip_and_restart(
     assert image.pixelColor(27, 4).name() == (theme.TEXT_2 if discreet else theme.ACCENT).lower()
     assert instance._update_action.text() == ("有可用更新…" if discreet else "下載新版 2.1.0…")
     assert instance._skip_update_action.text() == ("略過此更新" if discreet else "略過此版本")
-    assert instance._quit_action.text() == ("結束背景服務" if discreet else "結束 Desk Sentry")
-    if discreet:
-        assert all("Desk Sentry" not in action.text() for action in instance._menu.actions())
+    assert instance._quit_action.text() == "結束 Desk Sentry"
     instance.window.check_updates_button.click()
     assert opened and opened[0].endswith("/releases/tag/v2.1.0")
     assert request.call_count == 1
@@ -189,7 +187,7 @@ def test_error_persists_and_manual_development_only_shows_latest(local_app, qtbo
     qtbot.waitUntil(lambda: not restarted._update_busy, timeout=3000)
     assert restarted.window.update_status_label.text() == "開發版 · 最新正式版 2.1.0"
     assert not restarted._update_action.isVisible()
-    assert request.call_args.args[0].get_header("User-agent") == "DeskSentry/2.0.0"
+    assert request.call_args.args[0].get_header("User-agent") == f"DeskSentry/{__version__}"
 
 
 @pytest.mark.parametrize(

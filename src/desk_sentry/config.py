@@ -70,6 +70,8 @@ def normalize_target_apps(value: object) -> tuple[str, ...]:
 class Settings:
     schema_version: int = CURRENT_SCHEMA_VERSION
     camera_index: int = 0
+    camera_mode: str = "auto"
+    auto_yield_camera: bool = True
     armed: bool = True
     sensitivity: str = "medium"
     exclude_self: bool = True
@@ -127,6 +129,9 @@ class Settings:
         if type(s.schema_version) is not int or s.schema_version < 1:
             s.schema_version = CURRENT_SCHEMA_VERSION
         s.camera_index = min(max(int(s.camera_index), 0), 9)
+        if s.camera_mode not in ("auto", "exclusive"):
+            s.camera_mode = "auto"
+        s.auto_yield_camera = s.auto_yield_camera if isinstance(s.auto_yield_camera, bool) else True
         if s.sensitivity not in SENSITIVITY:
             s.sensitivity = "medium"
         if s.action not in ACTIONS:

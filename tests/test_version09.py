@@ -149,4 +149,4 @@ def test_collect_build_info_without_git_is_safe(
     assert info.version == desk_sentry.__version__
     assert info.commit == "unknown"
     assert info.dirty is False
-    assert info.display_version == "2.0.0+unknown"
+    assert info.display_version == f"{desk_sentry.__version__}+unknown"

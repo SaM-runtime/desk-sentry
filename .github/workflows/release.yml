@@ -41,8 +41,8 @@ jobs:
           path: models/*.onnx
           key: models-${{ runner.os }}-${{ hashFiles('tools/fetch_model.py') }}
 
-      - name: Install project, test tools, and PyInstaller
-        run: .\.venv\Scripts\python.exe -m pip install -e ".[dev]" "PyInstaller==6.21.0"
+      - name: Install project and test tools
+        run: .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
       - name: Verify repository identity
         shell: pwsh
@@ -78,10 +78,11 @@ jobs:
       - name: Prepare release metadata
         run: .\.venv\Scripts\python.exe packaging/build_release.py prepare --output .tmp/release
 
-      - name: Build application
+      - name: Build unpacked application bundle
         run: >-
-          .\.venv\Scripts\python.exe -m PyInstaller --noconfirm packaging/DeskSentry.spec
-          --distpath .tmp/release/dist --workpath .tmp/release/build
+          .\.venv\Scripts\python.exe packaging/build_release.py bundle
+          --output .tmp/release/dist/DeskSentry
+          --metadata-dir .tmp/release
 
       - name: Build installer with Inno Setup 6
         shell: pwsh

@@ -20,7 +20,7 @@ from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon, QWidget
 
-from desk_sentry import __version__, actions, config, schedule, startup
+from desk_sentry import __version__, actions, config, meeting, schedule, startup
 from desk_sentry.build_info import get_build_info
 from desk_sentry.config import Settings
 from desk_sentry.detector import Box, PersonDetector
@@ -63,6 +63,8 @@ _NEW_SETTINGS_OUTSIDE_DIAGNOSTICS = frozenset(
     {
         "away_action",
         "away_minutes",
+        "camera_mode",
+        "auto_yield_camera",
         "hide_hotkey_style",
         "pause_when_locked",
         "schedule_enabled",
@@ -95,15 +97,9 @@ def _diagnostics_settings(settings: Settings) -> dict[str, object]:
 
 
 def model_path() -> Path:
-    candidates = []
-    if getattr(sys, "frozen", False):
-        candidates.append(Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "models")
-    candidates.append(Path(__file__).resolve().parents[2] / "models")
-    candidates.append(Path.cwd() / "models")
-    for folder in candidates:
-        if (folder / MODEL_NAME).is_file():
-            return folder / MODEL_NAME
-    return candidates[0] / MODEL_NAME
+    """Resolve models beside the source/app directory, independent of the working directory."""
+
+    return Path(__file__).resolve().parents[2] / "models" / MODEL_NAME
 
 
 class _Bridge(QObject):
@@ -111,6 +107,7 @@ class _Bridge(QObject):
 
     snapshot = Signal(object)
     zone = Signal(object)
+    meeting = Signal(bool)
     update_result = Signal(object)
 
 
@@ -216,8 +213,14 @@ class DeskSentryApp:
                 logging.getLogger(__name__).info("Cannot reconcile cached update state: %s", error)
         self._wall_now = datetime.now
         self._locked = False
+        self._meeting_active = False
+        self._manual_yield = False
+        self._camera_mode = settings.camera_mode
+        self._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
         self._effective_armed = settings.armed
         self._pause_reason: str | None = None
+        self._pause_ack_reason: str | None = None
+        self._pause_request = 0
         self._away_plan = actions.AwayPlan()
         self.stats = AlertStats(settings_path.parent / "alert-stats.json", clock=self._wall_now)
         self._stats_day = self._wall_now().date()
@@ -318,15 +321,14 @@ class DeskSentryApp:
         self.window.on_open_diagnostics = self.open_diagnostics
         self.popup.on_dismissed = lambda: self._log("popup_dismissed")
 
-        self.tray = QSystemTrayIcon(
-            theme.neutral_icon() if settings.discreet else theme.app_icon(), app
-        )
+        self.tray = QSystemTrayIcon(theme.app_icon(), app)
         menu = QMenu()
         menu.setStyleSheet(TRAY_MENU_STYLE)
         menu.addAction("顯示設定視窗", self.exit_compact)
         self._compact_action = menu.addAction("小鏡子模式", self.enter_compact)
         menu.addAction("最近提醒", lambda: self.open_history(None))
         self._arm_action = menu.addAction("", self.window.toggle_armed)
+        self._yield_camera_action = menu.addAction("", self.toggle_camera_yield)
         self._pause_info = menu.addAction("")
         self._pause_info.setEnabled(False)
         self._pause_info.setVisible(False)
@@ -357,6 +359,7 @@ class DeskSentryApp:
 
         self._bridge.snapshot.connect(self._on_snapshot)
         self._bridge.zone.connect(self._on_zone)
+        self._bridge.meeting.connect(self._meeting_changed)
         models = model_path().parent
         self.engine = Engine(
             PersonDetector(model_path()),
@@ -381,7 +384,10 @@ class DeskSentryApp:
         self._apply_diagnostics(settings)
         self._sync_discreet_presentation(settings)
         self.engine.start()
+        self._meeting_monitor = meeting.MeetingMonitor(self._bridge.meeting.emit)
+        self._meeting_monitor.start()
         app.aboutToQuit.connect(self.shutdown_now)
+        app.aboutToQuit.connect(self._meeting_monitor.stop)
         app.aboutToQuit.connect(self._session_notifications.close)
         app.aboutToQuit.connect(self._schedule_resync_timer.stop)
         app.aboutToQuit.connect(self.discreet_cue.close)
@@ -396,6 +402,10 @@ class DeskSentryApp:
 
     # ------------------------------------------------------------ callbacks
     def _on_settings(self, settings: Settings) -> None:
+        previous_camera_mode = getattr(self, "_camera_mode", settings.camera_mode)
+        self._camera_mode = settings.camera_mode
+        if settings.camera_mode != previous_camera_mode:
+            self._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
         config.save(settings, self._path)
         self._apply_diagnostics(settings)
         self._log("settings", **_diagnostics_settings(settings))
@@ -592,6 +602,16 @@ class DeskSentryApp:
         self._locked = locked
         self._apply_monitoring()
 
+    def _meeting_changed(self, active: bool) -> None:
+        self._meeting_active = active
+        self._apply_monitoring()
+
+    def toggle_camera_yield(self) -> None:
+        """Keep the camera released until the user explicitly restores it."""
+
+        self._manual_yield = not getattr(self, "_manual_yield", False)
+        self._apply_monitoring()
+
     def _apply_monitoring(self) -> None:
         settings = self.window.settings
         now = self._wall_now()
@@ -601,20 +621,38 @@ class DeskSentryApp:
             settings.schedule_end,
             settings.schedule_days,
         )
-        self._effective_armed, self._pause_reason = schedule.effective_monitoring(
-            settings.armed,
-            self._locked and settings.pause_when_locked,
-            in_schedule,
-        )
+        previous_reason = getattr(self, "_pause_reason", None)
+        camera_backend = getattr(self, "_camera_backend", "exclusive")
+        if not settings.armed:
+            reason = "manual"
+        elif getattr(self, "_manual_yield", False):
+            reason = "manual_yield"
+        elif self._locked and settings.pause_when_locked:
+            reason = "locked"
+        elif not in_schedule:
+            reason = "schedule"
+        elif (
+            getattr(self, "_meeting_active", False)
+            and getattr(settings, "auto_yield_camera", True)
+            and camera_backend == "exclusive"
+        ):
+            reason = "meeting"
+        else:
+            reason = None
+        self._pause_reason = reason
+        self._effective_armed = reason is None
+        if reason != previous_reason:
+            self._pause_ack_reason = None
         if not self._effective_armed:
             self._health_state = HealthState.OK
             evade_plan = getattr(self, "_evade_plan", None)
             if evade_plan is not None:
                 evade_plan.cancel()
-        self.engine.apply(
+        pause_request = self.engine.apply(
             replace(settings, armed=self._effective_armed),
             pause_reason=self._pause_reason or "manual",
         )
+        self._pause_request = pause_request if type(pause_request) is int else 0
         self._schedule_timer.stop()
         boundary: datetime | None = None
         if settings.schedule_enabled:
@@ -632,6 +670,10 @@ class DeskSentryApp:
             self._pause_reason,
             now=now,
             next_start=boundary if self._pause_reason == "schedule" else None,
+            acknowledged=(
+                self._pause_reason not in ("meeting", "manual_yield")
+                or getattr(self, "_pause_ack_reason", None) == self._pause_reason
+            ),
         )
         if settings.discreet and not self._effective_armed:
             self.discreet_cue.update_status(Status.PAUSED)
@@ -660,6 +702,25 @@ class DeskSentryApp:
 
     def _on_snapshot(self, snap: Snapshot) -> None:
         settings = self.window.settings
+        backend = getattr(snap, "camera_backend", "exclusive")
+        if backend not in ("pending", "shared", "exclusive"):
+            backend = "pending"
+        backend_changed = backend != getattr(self, "_camera_backend", "exclusive")
+        self._camera_backend = backend
+        if backend_changed and getattr(self, "_meeting_active", False):
+            self._apply_monitoring()
+            settings = self.window.settings
+        acknowledged_reason = getattr(snap, "pause_reason", None)
+        acknowledged_request = getattr(snap, "pause_request", 0)
+        if (
+            snap.status is Status.PAUSED
+            and acknowledged_reason is not None
+            and acknowledged_reason == getattr(self, "_pause_reason", None)
+            and acknowledged_request == getattr(self, "_pause_request", 0)
+        ):
+            self._pause_ack_reason = acknowledged_reason
+            self.window.set_pause_reason(acknowledged_reason, acknowledged=True)
+            self._render_tray(settings, Status.PAUSED)
         if snap.status is Status.NOTICE and not settings.discreet:
             snap = replace(snap, status=Status.WATCHING)
         effective = getattr(self, "_effective_armed", settings.armed)
@@ -791,8 +852,10 @@ class DeskSentryApp:
     # ------------------------------------------------------------------ tray
     def _render_tray(self, settings: Settings, status: Status) -> None:
         degraded = getattr(self, "_health_state", HealthState.OK) is HealthState.DEGRADED
+        # Discreet mode keeps the recognizable app icon (a swapped icon confused
+        # testers) but in its fixed colour, so the tray does not reveal alerts.
         icon = (
-            theme.neutral_icon()
+            theme.app_icon()
             if settings.discreet
             else theme.app_icon(theme.STATUS_COLOR[Status.PAUSED if degraded else status])
         )
@@ -820,13 +883,22 @@ class DeskSentryApp:
             )
             self._skip_update_action.setText("略過此更新" if settings.discreet else "略過此版本")
         if hasattr(self, "_quit_action"):
-            self._quit_action.setText("結束背景服務" if settings.discreet else "結束 Desk Sentry")
+            self._quit_action.setText("結束 Desk Sentry")
         reason = getattr(self, "_pause_reason", None)
-        reason_text = {"locked": "已暫停 · 電腦鎖定中", "schedule": "已暫停 · 非監看時段"}.get(
-            reason or ""
-        )
+        reason_text = {
+            "locked": "已暫停 · 電腦鎖定中",
+            "schedule": "已暫停 · 非監看時段",
+        }.get(reason or "")
+        if reason in ("meeting", "manual_yield"):
+            if getattr(self, "_pause_ack_reason", None) != reason:
+                reason_text = "正在讓出攝影機"
+            elif reason == "meeting":
+                reason_text = "已暫停 · 會議中（已讓出攝影機）"
+            else:
+                reason_text = "已暫停 · 已讓出攝影機"
         tooltip = (
-            ("背景服務（中斷）" if degraded else "背景服務")
+            # Name stays visible so non-technical users can find it; status stays hidden.
+            ("Desk Sentry（低調模式・偵測中斷）" if degraded else "Desk Sentry（低調模式）")
             if settings.discreet
             else (
                 f"Desk Sentry · {reason_text or theme.STATUS_TEXT[status][0]}"
@@ -837,6 +909,10 @@ class DeskSentryApp:
         if hasattr(self, "_pause_info"):
             self._pause_info.setText(reason_text or "")
             self._pause_info.setVisible(reason_text is not None)
+        if hasattr(self, "_yield_camera_action"):
+            yielding = getattr(self, "_manual_yield", False)
+            self._yield_camera_action.setText("恢復使用攝影機" if yielding else "暫時讓出攝影機")
+            self._yield_camera_action.setEnabled(settings.armed or yielding)
         self._arm_action.setText("暫停監看" if settings.armed else "開始監看")
 
     def _on_tray(self, reason: QSystemTrayIcon.ActivationReason) -> None:

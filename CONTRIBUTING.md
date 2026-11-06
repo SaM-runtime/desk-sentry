@@ -11,7 +11,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-模型不納入 Git。第一次執行測試或打包前，請下載並驗證固定版本的模型：
+模型不納入 Git。第一次執行測試或建立發佈 bundle 前，請下載並驗證固定版本的模型：
 
 ```powershell
 .\.venv\Scripts\python.exe tools\fetch_model.py

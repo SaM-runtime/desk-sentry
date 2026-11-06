@@ -51,6 +51,11 @@ def local_app(qapp, qtbot, monkeypatch, tmp_path):
     monkeypatch.setattr(Engine, "start", lambda engine: started.append(engine))
     monkeypatch.setattr(hotkey, "Win32Backend", lambda _id: HotkeyBackend())
     monkeypatch.setattr(schedule, "Win32SessionBackend", SessionBackend)
+    monkeypatch.setattr(
+        app_module.meeting,
+        "WinRegistryReader",
+        lambda: SimpleNamespace(entries=lambda _capability: ()),
+    )
     monkeypatch.setattr(app_module.startup, "is_enabled", lambda: False)
     monkeypatch.setattr(app_module.actions, "list_app_windows", lambda: [])
     path = tmp_path / "settings.json"
@@ -66,6 +71,11 @@ def local_app(qapp, qtbot, monkeypatch, tmp_path):
 
     yield build, path, started
     for instance in instances:
+        monitor = instance._meeting_monitor
+        worker = monitor._thread
+        monitor.stop()
+        assert worker is None or not worker.is_alive()
+        qapp.aboutToQuit.disconnect(monitor.stop)
         cue = getattr(instance, "discreet_cue", None)
         if cue is not None:
             cue.close()

@@ -51,4 +51,4 @@ Desk Sentry 將攝影機當作桌面後照鏡：資訊應能一眼理解，平�
 
 ## 建置與發佈邊界
 
-`src/desk_sentry/__init__.py` 是版本號唯一來源。PyInstaller 建立 one-folder 成品，Inno Setup 建立每位使用者安裝程式；可攜版與 installer 都必須包含第三方聲明，發佈附件另提供 `SHA256SUMS.txt`。正式發佈前由維護者核對版本、測試、授權、成品雜湊及人工安裝流程。成品目前不含程式碼簽章。
+`src/desk_sentry/__init__.py` 是版本號唯一來源。發佈 bundle 由 python.org 官方 Windows 嵌入式 Python、原始碼、固定版本 wheel、模型與授權檔組成，不使用 PyInstaller 或自製執行檔；Inno Setup 再建立每位使用者安裝程式。可攜版與 installer 都必須包含第三方聲明，發佈附件另提供 `SHA256SUMS.txt`。正式發佈前由維護者核對版本、測試、授權、成品雜湊及人工安裝流程。Inno Setup 安裝程式目前不含程式碼簽章。

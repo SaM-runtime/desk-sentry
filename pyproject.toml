@@ -13,6 +13,16 @@ dependencies = [
   "numpy==2.5.1",
   "opencv-python-headless==5.0.0.93",
   "PySide6-Essentials==6.11.1",
+  "winrt-runtime==4.1.0",
+  "winrt-Windows.Media.Capture==4!10.0.28000.2957",
+  "winrt-Windows.Media.Capture.Frames==4!10.0.28000.2957",
+  "winrt-Windows.Media.MediaProperties==4!10.0.28000.2957",
+  "winrt-Windows.Media.Devices==4!10.0.28000.2957",
+  "winrt-Windows.Graphics.Imaging==4!10.0.28000.2957",
+  "winrt-Windows.Storage.Streams==4!10.0.28000.2957",
+  "winrt-Windows.Foundation==4!10.0.28000.2957",
+  "winrt-Windows.Foundation.Collections==4!10.0.28000.2957",
+  "winrt-Windows.Devices.Enumeration==4!10.0.28000.2957",
 ]
 
 [project.optional-dependencies]

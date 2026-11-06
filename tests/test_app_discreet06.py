@@ -130,7 +130,7 @@ def test_discreet_curtain_keeps_mirror_hidden_and_plain():
     assert instance.engine.preview_wanted is False
 
 
-def test_discreet_neutral_tray_identity_is_stable_across_statuses(qapp):
+def test_discreet_tray_keeps_app_icon_stable_across_statuses(qapp):
     instance = discreet_controller()
     instance._arm_action = Mock()
     captures = []
@@ -138,8 +138,8 @@ def test_discreet_neutral_tray_identity_is_stable_across_statuses(qapp):
     DeskSentryApp._render_tray(instance, instance.window.settings, Status.ALERT)
     DeskSentryApp._render_tray(instance, instance.window.settings, Status.APPROACHING)
     assert captures[0] == captures[1]
-    assert captures[0] == theme.neutral_icon().pixmap(24, 24).toImage()
-    instance.tray.setToolTip.assert_called_with("背景服務")
+    assert captures[0] == theme.app_icon().pixmap(24, 24).toImage()
+    instance.tray.setToolTip.assert_called_with("Desk Sentry（低調模式）")
     instance.window.settings.discreet = False
     DeskSentryApp._render_tray(instance, instance.window.settings, Status.CLEAR)
     assert captures[-1] != captures[0]
@@ -155,7 +155,7 @@ def test_discreet_startup_stays_in_tray_and_detection_still_starts(local_app):
     assert not instance.window.isVisible() and not instance.mini.isVisible()
     assert not instance.popup.isVisible()
     assert instance.engine.preview_wanted is False
-    assert instance.window.windowTitle() == "設定"
+    assert instance.window.windowTitle() == "Desk Sentry 後照鏡"
     assert instance.engine._settings.armed
 
 

@@ -2,7 +2,22 @@
 
 本檔依 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 整理使用者可見的變更，
 版本遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。
-2.0.0 整理目前可供發佈的功能與公開文件；實際成品與驗證狀態以該版本 Release 為準。
+實際成品與驗證狀態以各版本 Release 為準。
+
+## [2.0.1] - 2026-11-05
+
+### Added
+
+- 新增 Windows 共用唯讀攝影機後端，自動模式失敗時退回 DirectShow 相容模式。
+- 獨占模式下開會自動釋放攝影機，結束後防抖恢復；新增系統匣手動讓出／恢復操作。
+
+### Changed
+
+- 改為以 python.org 官方 Windows 嵌入式 Python、原始碼與固定版本相依套件組成免打包發佈，降低 PyInstaller bootloader 引起的防毒誤判。
+- 安裝版、開機啟動與可攜版統一透過內附的 `pythonw.exe -m desk_sentry` 啟動。
+- 共用模式支援 MJPG、NV12、YUY2 等原生格式，並在每次重新開啟攝影機時優先重試共用。
+- 低調模式改為保留原本的 Desk Sentry 圖示（固定顏色、不隨警示變色）與程式名稱，方便使用者找到程式。
+- 可攜版啟動檔在找不到內附 Python 時，以中文說明「尚未解壓縮」或「被防毒隔離」的處理方式。
 
 ## [2.0.0] - 2026-10-20
 

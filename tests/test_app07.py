@@ -280,11 +280,9 @@ def test_health_tooltip_and_icon_degrade_and_recover_without_notifications(discr
     controller._health_state = HealthState.DEGRADED
     DeskSentryApp._render_tray(controller, controller.window.settings, Status.ALERT)
     assert controller.tray.setToolTip.call_args.args[0] == (
-        "背景服務（中斷）" if discreet else "Desk Sentry · 後方有人（偵測中斷）"
+        "Desk Sentry（低調模式・偵測中斷）" if discreet else "Desk Sentry · 後方有人（偵測中斷）"
     )
-    expected = (
-        theme.neutral_icon() if discreet else theme.app_icon(theme.STATUS_COLOR[Status.PAUSED])
-    )
+    expected = theme.app_icon() if discreet else theme.app_icon(theme.STATUS_COLOR[Status.PAUSED])
     assert (
         controller.tray.setIcon.call_args.args[0].pixmap(24, 24).toImage()
         == expected.pixmap(24, 24).toImage()
