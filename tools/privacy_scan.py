@@ -49,6 +49,9 @@ def findings(name: str, text: str, extra: tuple | list = ()) -> list[str]:
             continue
         if email.lower().endswith("@users.noreply.github.com"):
             continue
+        # Public no-reply address used in AI co-author commit trailers.
+        if email.lower() == "noreply@anthropic.com":
+            continue
         hits.append("email")
     for match in IPV4.finditer(text):
         octets = tuple(map(int, match.group().split(".")))

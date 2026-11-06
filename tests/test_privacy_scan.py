@@ -79,3 +79,14 @@ def test_optional_rules_missing_default_and_invalid(tmp_path, monkeypatch, capsy
     monkeypatch.setattr(sys, "argv", ["privacy_scan.py", "--worktree"])
     assert module.main() == 1
     assert "read-error" in capsys.readouterr().out
+
+
+def test_public_noreply_addresses_are_allowed_but_real_emails_are_not():
+    spec = importlib.util.spec_from_file_location(
+        "privacy_scan", Path(__file__).parents[1] / "tools/privacy_scan.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.findings("<git-log>", "Co-Authored-By: X <noreply" + "@anthropic.com>") == []
+    assert module.findings("<git-log>", "1+someone" + "@users.noreply.github.com") == []
+    assert module.findings("<git-log>", "person" + "@example.org") == ["email"]
