@@ -9,10 +9,11 @@ from PySide6.QtCore import QAbstractAnimation, QCoreApplication, QEvent, QPoint,
 from PySide6.QtWidgets import QApplication, QWidget
 from pytestqt.qtbot import QtBot
 
+from desk_sentry.camera_shared import CameraInfo
 from desk_sentry.config import Settings
 from desk_sentry.engine import Snapshot, TrackView
 from desk_sentry.sentry import Role, Status
-from desk_sentry.ui import motion
+from desk_sentry.ui import motion, theme
 from desk_sentry.ui.main_window import MainWindow
 from desk_sentry.ui.mirror_view import MirrorView
 
@@ -116,7 +117,11 @@ def test_hidden_mirror_and_live_motion_preference_stop_animation(
 
 def test_segment_switch_and_stepper_report_settings_values(qtbot: QtBot) -> None:
     reports: list[Settings] = []
-    window = MainWindow(Settings(), reports.append)
+    window = MainWindow(
+        Settings(),
+        reports.append,
+        list_cameras=lambda: [CameraInfo(0, "Built in"), CameraInfo(1, "USB")],
+    )
     qtbot.addWidget(window)
     window.show()
     window.sensitivity.buttons[0].click()
@@ -127,8 +132,11 @@ def test_segment_switch_and_stepper_report_settings_values(qtbot: QtBot) -> None
     assert reports[-1].alert_far_passersby
     window.show_mirror.setChecked(False)
     assert not reports[-1].show_mirror and not window.corner_combo.isEnabled()
-    window.camera.plus.click()
+    qtbot.waitUntil(window.camera.isEnabled)
+    window.camera.setCurrentIndex(1)
+    window.camera.activated.emit(1)
     assert reports[-1].camera_index == 1
+    assert reports[-1].camera_name == "USB"
     window.still.setValue(21)
     assert reports[-1].stationary_mute_seconds == 21.0
     window.diagnostics.setChecked(True)
@@ -263,7 +271,10 @@ def test_focus_ring_only_for_keyboard_navigation(qtbot: QtBot) -> None:
             for y in range(image.height())
         )
 
-    window = MainWindow(Settings(), lambda _: None)
+    window = MainWindow(
+        Settings(), lambda _: None, list_cameras=lambda: [CameraInfo(0, "Built in")]
+    )
+    window.setStyleSheet(theme.STYLESHEET)
     qtbot.addWidget(window)
     window.show()
     window.activateWindow()
@@ -282,9 +293,10 @@ def test_focus_ring_only_for_keyboard_navigation(qtbot: QtBot) -> None:
     qtbot.keyClick(window.compact_button, Qt.Key.Key_Backtab)
     focused = QApplication.focusWidget()
     assert focused is not None and focused.property("keyboardFocus")
-    window.camera.spin.setFocus(Qt.FocusReason.TabFocusReason)
-    assert window.camera.spin.property("keyboardFocus")
-    assert accent_pixels(window.camera.spin) > 0
+    qtbot.waitUntil(window.camera.isEnabled)
+    window.camera.setFocus(Qt.FocusReason.TabFocusReason)
+    assert window.camera.property("keyboardFocus")
+    assert accent_pixels(window.camera) > 0
 
 
 @pytest.mark.parametrize(

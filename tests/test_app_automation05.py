@@ -8,9 +8,10 @@ from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 
 from desk_sentry import actions, schedule
-from desk_sentry.app import DeskSentryApp
+from desk_sentry.app import DeskSentryApp, _ObservedEvadePlan
 from desk_sentry.config import Settings
 from desk_sentry.engine import Snapshot
+from desk_sentry.health import HealthState
 from desk_sentry.people import Level
 from desk_sentry.sentry import Status
 from desk_sentry.stats import AlertStats
@@ -39,6 +40,10 @@ class EngineRecorder:
         self.settings = None
         self.reason = None
         self.diagnostics = None
+        self.exclusive_allowed = True
+
+    def set_exclusive_allowed(self, allowed):
+        self.exclusive_allowed = allowed
 
     def apply(self, settings, *, pause_reason):
         self.settings = settings
@@ -72,10 +77,35 @@ class TrayRecorder:
 def controller(settings, now=datetime(2026, 10, 12, 12)):
     app = DeskSentryApp.__new__(DeskSentryApp)
     app.window = SimpleNamespace(
-        settings=settings, set_pause_reason=lambda reason, **_context: None
+        settings=settings,
+        set_pause_reason=lambda reason, **_context: None,
+        set_camera_status=lambda *_args, **_kwargs: None,
+        set_camera_diagnostics=lambda _text: None,
     )
     app._wall_now = lambda: now
     app._locked = False
+    app._meeting_active = False
+    app._manual_yield = False
+    app._camera_mode = settings.camera_mode
+    app._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
+    app._camera_backend_detail = ""
+    app._camera_subtype = ""
+    app._camera_width = 0
+    app._camera_height = 0
+    app._camera_fps = 0.0
+    app._camera_nominal_fps = 0.0
+    app._last_camera_error = None
+    app._camera_unresponsive = False
+    app._camera_release_failed = False
+    app._build_info = SimpleNamespace(display_version="test", version="test")
+    app._available_update = None
+    app._discreet_active = False
+    app._pause_reason = None
+    app._pause_ack_reason = None
+    app._pause_request = 0
+    app._effective_armed = settings.armed
+    app._health_state = HealthState.OK
+    app._evade_plan = _ObservedEvadePlan()
     app._last_status = Status.CLEAR
     app.engine = EngineRecorder()
     app._schedule_timer = TimerRecorder()
