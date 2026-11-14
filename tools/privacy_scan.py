@@ -52,6 +52,9 @@ def findings(name: str, text: str, extra: tuple | list = ()) -> list[str]:
         # Public no-reply address used in AI co-author commit trailers.
         if email.lower() == "noreply@anthropic.com":
             continue
+        # Public committer of the merge commits GitHub creates for pull_request CI.
+        if email.lower() == "noreply@github.com":
+            continue
         hits.append("email")
     for match in IPV4.finditer(text):
         octets = tuple(map(int, match.group().split(".")))
@@ -98,7 +101,7 @@ def main() -> int:
                 for label in findings(name, value, extra):
                     failures.append(f"{name}:{line}:{label}")
         if not args.worktree:
-            log = git("log", "--format=%an%n%ae%n%cn%ce%n%B", "HEAD").decode("utf-8")
+            log = git("log", "--format=%an%n%ae%n%cn%n%ce%n%B", "HEAD").decode("utf-8")
             for line, value in enumerate(log.splitlines(), 1):
                 for label in findings("<git-log>", value, extra):
                     failures.append(f"<git-log>:{line}:{label}")

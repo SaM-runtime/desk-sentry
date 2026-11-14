@@ -89,4 +89,8 @@ def test_public_noreply_addresses_are_allowed_but_real_emails_are_not():
     spec.loader.exec_module(module)
     assert module.findings("<git-log>", "Co-Authored-By: X <noreply" + "@anthropic.com>") == []
     assert module.findings("<git-log>", "1+someone" + "@users.noreply.github.com") == []
+    # pull_request CI checks out a merge commit committed by GitHub.
+    assert module.findings("<git-log>", "noreply" + "@github.com") == []
     assert module.findings("<git-log>", "person" + "@example.org") == ["email"]
+    # A different local part at github.com is still a real address.
+    assert module.findings("<git-log>", "someone" + "@github.com") == ["email"]
