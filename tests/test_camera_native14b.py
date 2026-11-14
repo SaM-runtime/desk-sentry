@@ -118,10 +118,25 @@ def install_types(monkeypatch, capture, *, convert=None):
     settings = SimpleNamespace()
     types = {
         "DeviceInformation": SimpleNamespace(
-            find_all_async=lambda _kind: Done([SimpleNamespace(id="device-0")])
+            find_all_async=lambda _kind: Done([SimpleNamespace(id="device-0", name="USB Camera")])
         ),
         "DeviceClass": SimpleNamespace(VIDEO_CAPTURE=4),
         "AsyncStatus": SimpleNamespace(STARTED=0),
+        "MediaFrameSourceGroup": SimpleNamespace(
+            find_all_async=lambda: Done(
+                [
+                    SimpleNamespace(
+                        id="group-0",
+                        source_infos=[
+                            SimpleNamespace(
+                                source_kind=1,
+                                device_information=SimpleNamespace(id="device-0"),
+                            )
+                        ],
+                    )
+                ]
+            )
+        ),
         "MediaCaptureInitializationSettings": lambda: settings,
         "MediaCaptureSharingMode": SimpleNamespace(SHARED_READ_ONLY=1, EXCLUSIVE_CONTROL=0),
         "StreamingCaptureMode": SimpleNamespace(VIDEO=2),

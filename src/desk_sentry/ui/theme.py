@@ -34,7 +34,7 @@ STATUS_COLOR = {
 STATUS_TEXT = {
     Status.NOTICE: ("預警", "留意後方動態"),
     Status.PAUSED: ("已暫停", "攝影機已釋放，不會偵測"),
-    Status.NO_CAMERA: ("找不到攝影機", "會自動重試；確認攝影機編號或是否被占用"),
+    Status.NO_CAMERA: ("找不到攝影機", "會自動重試；確認攝影機連接或是否被占用"),
     Status.ERROR: ("偵測暫時出錯", "2 秒後自動重試"),
     Status.CLEAR: ("後方淨空", "監看中"),
     Status.AWAY: ("你不在座位", "沒有人需要提醒；回到座位後自動恢復"),

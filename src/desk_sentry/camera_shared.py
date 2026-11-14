@@ -6,6 +6,8 @@ list.  Windows does not guarantee that this order matches OpenCV/DirectShow.
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import cv2
@@ -15,10 +17,116 @@ from numpy.typing import NDArray
 Image = NDArray[np.uint8]
 
 
+@dataclass(frozen=True)
+class CameraInfo:
+    index: int
+    name: str
+    id: str = ""
+
+
+class CameraSourceUnavailableError(RuntimeError):
+    """The selected video device does not expose a COLOR frame source."""
+
+
+class CameraDisconnectedError(RuntimeError):
+    """The saved camera identity is not present in the WinRT device list."""
+
+
 class SharedCameraOperationStuckError(TimeoutError):
     """Cancellation did not finish, so fallback could race the same device."""
 
     camera_fatal = True
+
+
+def _operation_result(operation: Any, timeout: float, types: dict[str, Any]) -> Any:
+    status = operation.wait(timeout)
+    if status == types["AsyncStatus"].STARTED:
+        operation.cancel()
+        if operation.wait(timeout) == types["AsyncStatus"].STARTED:
+            raise SharedCameraOperationStuckError(
+                "WinRT camera operation did not stop after cancellation"
+            )
+        raise TimeoutError("WinRT camera operation timed out")
+    return operation.get()
+
+
+def _color_device_ids(groups: list[Any], color_kind: Any) -> set[str]:
+    """Return COLOR IDs, or an empty set to disable incomplete identity filtering."""
+    ids: set[str] = set()
+    for group in groups:
+        for source_info in getattr(group, "source_infos", ()):
+            if getattr(source_info, "source_kind", None) != color_kind:
+                continue
+            device = getattr(source_info, "device_information", None)
+            identifier = getattr(device, "id", None)
+            if not identifier or not str(identifier).strip():
+                return set()
+            ids.add(str(identifier).casefold())
+    return ids
+
+
+def _enumerate(types: dict[str, Any], timeout: float) -> tuple[list[Any], list[Any]]:
+    groups = list(
+        _operation_result(types["MediaFrameSourceGroup"].find_all_async(), timeout, types)
+    )
+    device_type = types.get("DeviceInformation")
+    device_class = types.get("DeviceClass")
+    if device_type is None or device_class is None:
+        return [], groups
+    devices = list(
+        _operation_result(device_type.find_all_async(device_class.VIDEO_CAPTURE), timeout, types)
+    )
+    return devices, groups
+
+
+def sole_camera_matches(camera_id: str, camera_name: str, timeout: float = 3.0) -> bool:
+    """Return whether the only WinRT video device matches the saved identity."""
+
+    try:
+        types = _winrt_types()
+        device_type = types.get("DeviceInformation")
+        device_class = types.get("DeviceClass")
+        if device_type is None or device_class is None:
+            return False
+        devices = list(
+            _operation_result(
+                device_type.find_all_async(device_class.VIDEO_CAPTURE),
+                timeout,
+                types,
+            )
+        )
+        if len(devices) != 1:
+            return False
+        device = devices[0]
+        actual_id = str(getattr(device, "id", ""))
+        actual_name = str(getattr(device, "name", ""))
+        return bool(
+            (camera_id and actual_id.casefold() == camera_id.casefold())
+            or (camera_name and actual_name == camera_name)
+        )
+    except Exception:
+        return False
+
+
+def list_cameras(timeout: float = 3.0) -> list[CameraInfo]:
+    """Filter video devices by COLOR only when the source identities are complete."""
+
+    try:
+        types = _winrt_types()
+        devices, groups = _enumerate(types, timeout)
+        color_kind = types["MediaFrameSourceKind"].COLOR
+        color_ids = _color_device_ids(groups, color_kind)
+        return [
+            CameraInfo(
+                index,
+                str(getattr(device, "name", "")),
+                str(getattr(device, "id", "")),
+            )
+            for index, device in enumerate(devices)
+            if not color_ids or str(getattr(device, "id", "")).casefold() in color_ids
+        ]
+    except Exception:
+        return []
 
 
 def bgra_to_bgr(data: bytes | bytearray | memoryview, *, width: int, height: int) -> Image:
@@ -42,28 +150,63 @@ class SharedCameraCapture:
         *,
         operation_timeout: float = 3.0,
         sharing_mode: Literal["shared", "exclusive"] = "shared",
+        camera_name: str = "",
+        camera_id: str = "",
     ) -> None:
         if sharing_mode not in ("shared", "exclusive"):
             raise ValueError("sharing_mode must be 'shared' or 'exclusive'")
         self.index = index
+        self.camera_name = camera_name
+        self.camera_id = camera_id
         self._size = (width, height)
         self._operation_timeout = operation_timeout
         self._sharing_mode = sharing_mode
         self._capture: Any | None = None
         self._reader: Any | None = None
         self._types: dict[str, Any] | None = None
+        self.subtype = ""
+        self.width = 0
+        self.height = 0
+        self.fps = 0.0
+        self._source_fps = 0.0
 
     def open(self) -> None:
         types = _winrt_types()
         self._types = types
-        devices = self._get(
-            types["DeviceInformation"].find_all_async(types["DeviceClass"].VIDEO_CAPTURE)
+        devices, groups = _enumerate(types, self._operation_timeout)
+        color_kind = types["MediaFrameSourceKind"].COLOR
+        color_ids = _color_device_ids(groups, color_kind)
+        selected = next(
+            (
+                device
+                for device in devices
+                if self.camera_id
+                and str(getattr(device, "id", "")).casefold() == self.camera_id.casefold()
+            ),
+            None,
         )
-        if self.index < 0 or self.index >= len(devices):
-            raise IndexError("camera index is outside the WinRT device list")
+        if selected is None and self.camera_name:
+            named = [
+                (position, device)
+                for position, device in enumerate(devices)
+                if getattr(device, "name", None) == self.camera_name
+            ]
+            if named:
+                _, selected = min(named, key=lambda item: (abs(item[0] - self.index), item[0]))
+        if selected is None:
+            if self.camera_id or self.camera_name:
+                raise CameraDisconnectedError("選擇的攝影機未連接")
+            if self.index < 0 or self.index >= len(devices):
+                raise IndexError("camera index is outside the WinRT device list")
+            selected = devices[self.index]
+        device_id = str(getattr(selected, "id", ""))
+        if groups and color_ids and device_id.casefold() not in color_ids:
+            raise CameraSourceUnavailableError(
+                "selected camera does not expose a COLOR frame source"
+            )
 
         settings = types["MediaCaptureInitializationSettings"]()
-        settings.video_device_id = devices[self.index].id
+        settings.video_device_id = device_id
         settings.sharing_mode = (
             types["MediaCaptureSharingMode"].SHARED_READ_ONLY
             if self._sharing_mode == "shared"
@@ -77,10 +220,23 @@ class SharedCameraCapture:
         try:
             self._get(capture.initialize_async(settings))
             source = next(
-                source
-                for source in capture.frame_sources.values()
-                if source.info.source_kind == types["MediaFrameSourceKind"].COLOR
+                (
+                    source
+                    for source in capture.frame_sources.values()
+                    if source.info.source_kind == types["MediaFrameSourceKind"].COLOR
+                ),
+                None,
             )
+            if source is None:
+                raise CameraSourceUnavailableError(
+                    "selected camera does not expose a COLOR frame source"
+                )
+            # Converted BGRA8 frames may carry a 0/0 rate; the source's native
+            # format still declares what the driver delivers.
+            try:
+                self._source_fps = self._nominal_fps(source.current_format)
+            except Exception:  # noqa: BLE001 - diagnostics only; never block capture
+                self._source_fps = 0.0
             reader = self._get(
                 capture.create_frame_reader_async(
                     source,
@@ -114,15 +270,7 @@ class SharedCameraCapture:
         types = self._types
         if types is None:
             raise RuntimeError("WinRT types are not loaded")
-        status = operation.wait(self._operation_timeout)
-        if status == types["AsyncStatus"].STARTED:
-            operation.cancel()
-            if operation.wait(self._operation_timeout) == types["AsyncStatus"].STARTED:
-                raise SharedCameraOperationStuckError(
-                    "WinRT camera operation did not stop after cancellation"
-                )
-            raise TimeoutError("WinRT camera operation timed out")
-        return operation.get()
+        return _operation_result(operation, self._operation_timeout, types)
 
     def read(self) -> tuple[bool, Image | None]:
         reader = self._reader
@@ -132,22 +280,31 @@ class SharedCameraCapture:
         reference = reader.try_acquire_latest_frame()
         if reference is None:
             return False, None
+        self.fps = 0.0
         source_bitmap = None
         try:
+            frame_format = getattr(reference, "format", None)
+            # Read the declared rate before choosing a decode path: the normal
+            # BGRA8 reader returns early but Windows still reports the rate.
+            self.fps = self._nominal_fps(frame_format) or self._source_fps
             video = getattr(reference, "video_media_frame", None)
             source_bitmap = video.software_bitmap if video is not None else None
             if (
                 source_bitmap is not None
                 and source_bitmap.bitmap_pixel_format == types["BitmapPixelFormat"].BGRA8
             ):
+                self.subtype = "BGRA8"
+                self.width = int(source_bitmap.pixel_width)
+                self.height = int(source_bitmap.pixel_height)
                 return self._bitmap_frame(source_bitmap, types)
 
-            frame_format = getattr(reference, "format", None)
             data = self._frame_bytes(reference)
             if frame_format is not None and data is not None:
                 subtype = str(frame_format.subtype).upper()
                 video_format = frame_format.video_format
                 width, height = int(video_format.width), int(video_format.height)
+                self.subtype = subtype
+                self.width, self.height = width, height
                 if subtype in ("MJPG", "MJPEG"):
                     frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
                     if frame is None:
@@ -184,12 +341,41 @@ class SharedCameraCapture:
         return np.frombuffer(memoryview(buffer), dtype=np.uint8, count=length)
 
     @staticmethod
+    def _nominal_fps(frame_format: Any) -> float:
+        """Return the frame rate Windows declares for a frame, or 0.0 when unknown."""
+
+        try:
+            frame_rate = getattr(frame_format, "frame_rate", None)
+            numerator = float(getattr(frame_rate, "numerator", 0) or 0)
+            denominator = float(getattr(frame_rate, "denominator", 0) or 0)
+        except (TypeError, ValueError, OSError):
+            return 0.0
+        if denominator <= 0 or numerator <= 0:
+            return 0.0
+        rate = numerator / denominator
+        return rate if math.isfinite(rate) else 0.0
+
+    @staticmethod
     def _nv12_frame(data: NDArray[np.uint8], width: int, height: int) -> tuple[bool, Image | None]:
-        expected = width * height * 3 // 2
-        if data.size < expected:
+        if width <= 0 or height <= 0 or width % 2 or height % 2:
             return False, None
-        nv12_data = data[:expected].reshape(height * 3 // 2, width)
-        return True, np.asarray(cv2.cvtColor(nv12_data, cv2.COLOR_YUV2BGR_NV12), np.uint8)
+        aligned_width = ((width + 63) // 64) * 64
+        aligned_heights = (
+            height,
+            ((height + 15) // 16) * 16,
+            ((height + 31) // 32) * 32,
+        )
+        candidates = [(width, value) for value in aligned_heights]
+        candidates.extend((aligned_width, value) for value in aligned_heights)
+        for stride, aligned_height in dict.fromkeys(candidates):
+            expected = stride * aligned_height * 3 // 2
+            if data.size != expected:
+                continue
+            y_plane = data[: stride * aligned_height].reshape(aligned_height, stride)
+            uv_plane = data[stride * aligned_height :].reshape(aligned_height // 2, stride)
+            tight = np.vstack((y_plane[:height, :width], uv_plane[: height // 2, :width]))
+            return True, np.asarray(cv2.cvtColor(tight, cv2.COLOR_YUV2BGR_NV12), np.uint8)
+        return False, None
 
     @staticmethod
     def _yuy2_frame(data: NDArray[np.uint8], width: int, height: int) -> tuple[bool, Image | None]:
@@ -224,13 +410,37 @@ class SharedCameraCapture:
             if pixel_format == bgra8:
                 size = width * height * 4
             elif pixel_format == nv12:
-                size = width * height * 3 // 2
+                stride = ((width + 63) // 64) * 64
+                heights = (
+                    height,
+                    ((height + 15) // 16) * 16,
+                    ((height + 31) // 32) * 32,
+                )
+                sizes = sorted(
+                    {width * value * 3 // 2 for value in heights}
+                    | {stride * value * 3 // 2 for value in heights}
+                )
             else:
                 size = width * height * 2
-            buffer = types["Buffer"](size)
-            buffer.length = buffer.capacity
-            bitmap.copy_to_buffer(buffer)
-            data = np.frombuffer(memoryview(buffer), dtype=np.uint8, count=size)
+            if pixel_format == nv12:
+                buffer = None
+                for size in sizes:
+                    candidate = types["Buffer"](size)
+                    candidate.length = candidate.capacity
+                    try:
+                        bitmap.copy_to_buffer(candidate)
+                    except (ValueError, OSError, RuntimeError):
+                        continue
+                    buffer = candidate
+                    break
+                if buffer is None:
+                    return False, None
+            else:
+                buffer = types["Buffer"](size)
+                buffer.length = buffer.capacity
+                bitmap.copy_to_buffer(buffer)
+            actual_length = int(buffer.length)
+            data = np.frombuffer(memoryview(buffer), dtype=np.uint8, count=actual_length)
             if pixel_format == nv12:
                 return SharedCameraCapture._nv12_frame(data, width, height)
             if pixel_format == yuy2:
@@ -282,6 +492,7 @@ def _winrt_types() -> dict[str, Any]:
     from winrt.windows.media.capture.frames import (
         MediaFrameReaderAcquisitionMode,
         MediaFrameReaderStartStatus,
+        MediaFrameSourceGroup,
         MediaFrameSourceKind,
     )
     from winrt.windows.media.mediaproperties import MediaEncodingSubtypes
@@ -301,6 +512,7 @@ def _winrt_types() -> dict[str, Any]:
         "StreamingCaptureMode": StreamingCaptureMode,
         "MediaFrameReaderAcquisitionMode": MediaFrameReaderAcquisitionMode,
         "MediaFrameReaderStartStatus": MediaFrameReaderStartStatus,
+        "MediaFrameSourceGroup": MediaFrameSourceGroup,
         "MediaFrameSourceKind": MediaFrameSourceKind,
         "MediaEncodingSubtypes": MediaEncodingSubtypes,
         "Buffer": Buffer,

@@ -70,6 +70,8 @@ def normalize_target_apps(value: object) -> tuple[str, ...]:
 class Settings:
     schema_version: int = CURRENT_SCHEMA_VERSION
     camera_index: int = 0
+    camera_id: str = ""
+    camera_name: str = ""
     camera_mode: str = "auto"
     auto_yield_camera: bool = True
     armed: bool = True
@@ -129,6 +131,8 @@ class Settings:
         if type(s.schema_version) is not int or s.schema_version < 1:
             s.schema_version = CURRENT_SCHEMA_VERSION
         s.camera_index = min(max(int(s.camera_index), 0), 9)
+        s.camera_id = s.camera_id if isinstance(s.camera_id, str) else ""
+        s.camera_name = s.camera_name if isinstance(s.camera_name, str) else ""
         if s.camera_mode not in ("auto", "exclusive"):
             s.camera_mode = "auto"
         s.auto_yield_camera = s.auto_yield_camera if isinstance(s.auto_yield_camera, bool) else True

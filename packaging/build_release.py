@@ -58,6 +58,35 @@ _LAUNCHER_LINES = (
     'start "" "%~dp0python\\pythonw.exe" -m desk_sentry',
 )
 
+_UNUSED_BUNDLE_PATTERNS = (
+    "cv2/opencv_videoio_ffmpeg*.dll",
+    "PySide6/opengl32sw.dll",
+    "PySide6/Qt6Quick*.dll",
+    "PySide6/Qt6Qml*.dll",
+    "PySide6/Qt6Labs*.dll",
+    "PySide6/Qt6Lottie*.dll",
+    "PySide6/Qt6Designer*.dll",
+    "PySide6/Qt6OpenGL*.dll",
+    "PySide6/QtOpenGL*.pyd",
+    "PySide6/QtQuick*.pyd",
+    "PySide6/QtQml*.pyd",
+    "PySide6/QtDesigner*.pyd",
+    "PySide6/resources/icudtl.dat",
+    "PySide6/translations/qtwebengine*",
+)
+
+
+def bundle_prune_patterns() -> tuple[str, ...]:
+    """Return runtime files verified unused by the application source tree."""
+
+    return _UNUSED_BUNDLE_PATTERNS
+
+
+def _prune_unused_bundle_files(site: Path) -> None:
+    for pattern in bundle_prune_patterns():
+        for path in site.glob(pattern):
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+
 
 def _install_dependencies(target: Path, root: Path) -> None:
     dependencies = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
@@ -127,6 +156,7 @@ def bundle(
         )
         site = interpreter / "Lib/site-packages"
         _install_dependencies(site, root)
+        _prune_unused_bundle_files(site)
         # Wheel command-line tools are not app runtime dependencies; never ship launchers.
         for path in list(site.rglob("*")):
             if path.is_file() and path.suffix.lower() == ".exe":
@@ -134,6 +164,9 @@ def bundle(
         for path in site.iterdir():
             if path.name.lower().split("-")[0] in {"pip", "setuptools", "pkg_resources"}:
                 shutil.rmtree(path) if path.is_dir() else path.unlink()
+        # The app uses Qt Widgets only; PySide6's QML tree is unused and its deep
+        # build-artifact paths can exceed Windows MAX_PATH after "Extract All".
+        shutil.rmtree(site / "PySide6/qml", ignore_errors=True)
         shutil.copytree(
             root / "src/desk_sentry",
             tree / "app/desk_sentry",

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime
+from threading import Thread
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -15,6 +17,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTime,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import (
@@ -29,6 +32,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
+    QApplication,
     QComboBox,
     QFrame,
     QGraphicsOpacityEffect,
@@ -72,9 +76,10 @@ from desk_sentry.ui.people import PeopleEditor
 
 SettingsCallback = Callable[[Settings], None]
 AppLister = Callable[[], list[tuple[str, str]]]  # (exe, example window title)
+CameraLister = Callable[[], list[object]]
 
 _SENSITIVITY = [("low", "低"), ("medium", "中"), ("high", "高")]
-_CAMERA_MODES = [("auto", "自動（優先共用）"), ("exclusive", "相容模式（獨占）")]
+_CAMERA_MODES = [("auto", "自動（建議）"), ("exclusive", "相容模式（獨占）")]
 _AUTOMATIC_PAUSE_REASONS = ("locked", "schedule", "meeting", "manual_yield")
 _SENSITIVITY_HINT = {
     "low": "約 3 公尺內有人移動才提醒",
@@ -206,6 +211,16 @@ class _SettingsCard(QFrame):
             self._content.addWidget(_divider())
         self._content.addWidget(row)
         return row
+
+
+class _CameraDropDown(DropDown):
+    """Camera picker that refreshes when its popup is opened."""
+
+    popup_shown = Signal()
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt API
+        self.popup_shown.emit()
+        super().showPopup()
 
 
 class _Scrim(QWidget):
@@ -397,6 +412,8 @@ class _MainMirrorView(MirrorView):
 
 
 class MainWindow(QMainWindow):
+    _camera_list_ready = Signal(int, object)
+
     def __init__(
         self,
         settings: Settings,
@@ -407,10 +424,21 @@ class MainWindow(QMainWindow):
         people: PeopleBook | None = None,
         display_version: str | None = None,
         screen_catalog: ScreenCatalog | None = None,
+        list_cameras: CameraLister | None = None,
     ) -> None:
         super().__init__()
         self._autostart = autostart
         self._list_apps = list_apps or (lambda: [])
+        self._list_cameras = list_cameras or self._default_camera_lister
+        self._camera_list_generation = 0
+        self._camera_retry_timer = QTimer(self)
+        self._camera_retry_timer.setInterval(10_000)
+        self._camera_retry_timer.timeout.connect(
+            lambda: self._request_camera_list(show_loading=False)
+        )
+        self._camera_diagnostics = ""
+        self._camera_status_presentation: tuple[str, str] | None = None
+        self._camera_list_ready.connect(self._apply_camera_list)
         self._people = people
         self.screen_catalog = screen_catalog or ScreenCatalog()
         if screen_catalog is None:
@@ -464,6 +492,7 @@ class MainWindow(QMainWindow):
         self._render_armed()
         self._sync_discreet_ui()
         self._sync_responsive_layout(force=True)
+        self._request_camera_list()
 
     # ---------------------------------------------------------------- layout
     def _build_main(self) -> QWidget:
@@ -674,11 +703,13 @@ class MainWindow(QMainWindow):
             lambda value: self._update(stationary_mute_seconds=float(value))
         )
         detection.add_row(_setting_row("靜止多久後不再提醒", self.still, "例如坐在你後面的同事"))
-        self.camera = Stepper()
-        self.camera.setRange(0, 9)
-        self.camera.setValue(s.camera_index)
-        self.camera.valueChanged.connect(lambda value: self._update(camera_index=int(value)))
-        detection.add_row(_setting_row("攝影機", self.camera, "內建是 0，外接是 1"))
+        self.camera = _CameraDropDown()
+        self.camera.setFixedSize(theme.D["dropdown_width"], theme.D["control_height"])
+        self.camera.addItem("讀取中…", None)
+        self.camera.setEnabled(False)
+        self.camera.activated.connect(self._camera_chosen)
+        self.camera.popup_shown.connect(lambda: self._request_camera_list(show_loading=False))
+        detection.add_row(_setting_row("攝影機", self.camera, "換攝影機後會自動重新連線"))
         self.camera_mode = _combo(_CAMERA_MODES, s.camera_mode)
         self.camera_mode.currentIndexChanged.connect(
             lambda _index: self._update(camera_mode=str(self.camera_mode.currentData()))
@@ -690,6 +721,27 @@ class MainWindow(QMainWindow):
                 "自動模式會先嘗試與視訊會議共用攝影機",
             )
         )
+        camera_status_box = QWidget()
+        camera_status_layout = QHBoxLayout(camera_status_box)
+        camera_status_layout.setContentsMargins(0, 0, 0, 0)
+        camera_status_layout.setSpacing(theme.D["space_8"])
+        self.camera_status_dot = QLabel()
+        self.camera_status_dot.setFixedSize(theme.D["dot"], theme.D["dot"])
+        camera_status_layout.addWidget(self.camera_status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.camera_status = QLabel()
+        self.camera_status.setObjectName("cameraStatus")
+        self.camera_status.setWordWrap(True)
+        self.camera_status.setMinimumWidth(0)
+        self.camera_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        camera_status_layout.addWidget(self.camera_status, 1)
+        self.copy_camera_diagnostics = QPushButton("複製診斷資訊")
+        self.copy_camera_diagnostics.setObjectName("secondaryButton")
+        self.copy_camera_diagnostics.setFixedHeight(theme.D["control_height"])
+        self.copy_camera_diagnostics.setEnabled(False)
+        self.copy_camera_diagnostics.clicked.connect(self._copy_camera_diagnostics)
+        camera_status_layout.addWidget(self.copy_camera_diagnostics)
+        detection.add_row(_setting_row("目前狀態", camera_status_box, stacked=True))
+        self.set_camera_status("pending")
         self.auto_yield_camera = Switch()
         self.auto_yield_camera.setChecked(s.auto_yield_camera)
         self.auto_yield_camera.toggled.connect(
@@ -1233,6 +1285,239 @@ class MainWindow(QMainWindow):
         self._on_settings(self._settings)
         if preview and self._settings.discreet and self.on_preview_cue is not None:
             self.on_preview_cue(False)
+
+    @staticmethod
+    def _default_camera_lister() -> list[object]:
+        from desk_sentry.camera_shared import list_cameras
+
+        return list(list_cameras())
+
+    def _request_camera_list(self, *, show_loading: bool = True) -> None:
+        self._camera_retry_timer.stop()
+        self._camera_list_generation += 1
+        generation = self._camera_list_generation
+        if show_loading:
+            self.camera.blockSignals(True)
+            self.camera.clear()
+            self.camera.addItem("讀取中…", None)
+            self.camera.setEnabled(False)
+            self.camera.blockSignals(False)
+
+        def load_cameras() -> None:
+            try:
+                cameras = list(self._list_cameras())
+            except Exception:
+                cameras = []
+            with suppress(RuntimeError):
+                self._camera_list_ready.emit(generation, cameras)
+
+        Thread(target=load_cameras, name="camera-list", daemon=True).start()
+
+    def _apply_camera_list(self, generation: int, cameras: object) -> None:
+        if generation != self._camera_list_generation:
+            return
+        entries: list[tuple[int, str, str]] = []
+        if isinstance(cameras, list):
+            for position, camera in enumerate(cameras):
+                name = str(getattr(camera, "name", "") or "").strip()
+                if not name:
+                    continue
+                try:
+                    index = int(getattr(camera, "index", position))
+                except (TypeError, ValueError):
+                    index = position
+                camera_id = str(getattr(camera, "id", "") or "")
+                entries.append((index, camera_id, name))
+
+        stored_id = self._settings.camera_id
+        stored_name = self._settings.camera_name
+        self.camera.blockSignals(True)
+        self.camera.clear()
+        if not entries:
+            if stored_id or stored_name:
+                offline_name = stored_name or "選擇的攝影機"
+                self.camera.addItem(
+                    f"{offline_name}（未連接）",
+                    (self._settings.camera_index, stored_id, stored_name),
+                )
+            else:
+                self.camera.addItem("找不到攝影機（點開重新搜尋）", None)
+            self.camera.setEnabled(True)
+            self.camera.blockSignals(False)
+            self._camera_retry_timer.start()
+            return
+
+        name_counts: dict[str, int] = {}
+        for _index, _camera_id, name in entries:
+            name_counts[name] = name_counts.get(name, 0) + 1
+
+        matched_entry = -1
+        if stored_id:
+            stored_id_key = stored_id.casefold()
+            matched_entry = next(
+                (
+                    i
+                    for i, (_index, camera_id, _name) in enumerate(entries)
+                    if camera_id.casefold() == stored_id_key
+                ),
+                -1,
+            )
+        if matched_entry < 0 and stored_name:
+            matches = [
+                (i, abs(index - self._settings.camera_index))
+                for i, (index, _camera_id, name) in enumerate(entries)
+                if name == stored_name
+            ]
+            if matches:
+                matched_entry = min(matches, key=lambda match: (match[1], match[0]))[0]
+        if matched_entry < 0 and not stored_id and not stored_name:
+            matched_entry = next(
+                (
+                    i
+                    for i, (index, _camera_id, _name) in enumerate(entries)
+                    if index == self._settings.camera_index
+                ),
+                -1,
+            )
+
+        offline = bool(stored_id or stored_name) and matched_entry < 0
+        if offline:
+            offline_name = stored_name or "選擇的攝影機"
+            self.camera.addItem(
+                f"{offline_name}（未連接）",
+                (self._settings.camera_index, stored_id, stored_name),
+            )
+
+        occurrences: dict[str, int] = {}
+        for index, camera_id, name in entries:
+            occurrences[name] = occurrences.get(name, 0) + 1
+            ordinal = occurrences[name]
+            label = f"{name} ({ordinal})" if name_counts[name] > 1 and ordinal > 1 else name
+            self.camera.addItem(label, (index, camera_id, name))
+
+        selected = 0 if offline else matched_entry
+        auto_select = not stored_id and not stored_name and selected < 0
+        if auto_select:
+            selected = 0
+        elif not offline:
+            selected = max(0, selected)
+        self.camera.setCurrentIndex(selected)
+        self.camera.setEnabled(True)
+        self.camera.blockSignals(False)
+
+        if auto_select:
+            camera_index, camera_id, camera_name = self.camera.itemData(selected)
+            self._update(
+                camera_index=int(camera_index),
+                camera_id=str(camera_id),
+                camera_name=str(camera_name),
+            )
+
+    def _camera_chosen(self, index: int) -> None:
+        data = self.camera.itemData(index)
+        if not isinstance(data, tuple) or len(data) != 3:
+            return
+        camera_index, camera_id, camera_name = data
+        selected = (int(camera_index), str(camera_id), str(camera_name))
+        current = (
+            self._settings.camera_index,
+            self._settings.camera_id,
+            self._settings.camera_name,
+        )
+        if selected == current:
+            return
+        self._update(
+            camera_index=selected[0],
+            camera_id=selected[1],
+            camera_name=selected[2],
+        )
+
+    def set_camera_status(
+        self,
+        backend: str,
+        *,
+        backend_detail: str = "",
+        subtype: str = "",
+        width: int = 0,
+        height: int = 0,
+        fps: float = 0.0,
+        last_error: str | None = None,
+        meeting_active: bool = False,
+        unresponsive: bool = False,
+        acknowledged: bool = True,
+        release_failed: bool = False,
+    ) -> None:
+        del backend_detail, subtype, width, height, fps
+        release_requested = (
+            self._pause_reason in ("meeting", "manual_yield")
+            or backend == "yielded"
+            or (backend == "exclusive" and meeting_active and self._settings.auto_yield_camera)
+        )
+        transient_release_failed = release_requested and not acknowledged and unresponsive
+        disconnected = last_error == "CameraDisconnectedError" and (
+            backend == "pending" or unresponsive
+        )
+        if release_failed:
+            text = "無法確認已讓出攝影機；若會議軟體拿不到畫面，請結束 Desk Sentry"
+            color = theme.STATUS_COLOR[Status.ERROR]
+        elif transient_release_failed:
+            text = "無法讓出攝影機，稍後自動重試"
+            color = theme.STATUS_COLOR[Status.ERROR]
+        elif disconnected:
+            text = "選擇的攝影機未連接"
+            color = theme.STATUS_COLOR[Status.ERROR]
+        elif release_requested and not acknowledged:
+            text = "正在讓出攝影機…"
+            color = theme.STATUS_COLOR[Status.PAUSED]
+        elif release_requested:
+            text = "已讓出給視訊會議，結束後自動恢復"
+            color = theme.STATUS_COLOR[Status.WATCHING]
+        elif backend == "locked":
+            text = "已暫停 · 電腦鎖定中"
+            color = theme.STATUS_COLOR[Status.PAUSED]
+        elif backend == "schedule":
+            text = "已暫停 · 非監看時段"
+            color = theme.STATUS_COLOR[Status.PAUSED]
+        elif not self._settings.armed or backend in ("paused", "manual"):
+            text = "已暫停"
+            color = theme.STATUS_COLOR[Status.PAUSED]
+        elif unresponsive:
+            text = "攝影機沒有回應，稍後自動重試"
+            color = theme.STATUS_COLOR[Status.ERROR]
+        elif backend == "shared":
+            text = "共用中，可與視訊會議同時使用"
+            color = theme.STATUS_COLOR[Status.CLEAR]
+        elif backend == "exclusive":
+            text = (
+                "相容模式：Teams、Zoom 等會議軟體開麥克風時自動讓出"
+                if self._settings.auto_yield_camera
+                else "相容模式：開會時需先暫停 Desk Sentry"
+            )
+            color = theme.STATUS_COLOR[Status.ALERT]
+        else:
+            text = "連線中…"
+            color = theme.STATUS_COLOR[Status.PAUSED]
+        presentation = (text, color)
+        if presentation == self._camera_status_presentation:
+            return
+        self._camera_status_presentation = presentation
+        self.camera_status.setText(text)
+        self.camera_status.setAccessibleName(f"攝影機目前狀態：{text}")
+        self.camera_status_dot.setStyleSheet(
+            f"background: {color}; border-radius: {theme.D['dot'] // 2}px;"
+        )
+
+    def set_camera_diagnostics(self, text: str) -> None:
+        self._camera_diagnostics = str(text)
+        self.copy_camera_diagnostics.setEnabled(bool(self._camera_diagnostics))
+
+    def _copy_camera_diagnostics(self) -> None:
+        QApplication.clipboard().setText(self._camera_diagnostics)
+        self.copy_camera_diagnostics.setText("已複製")
+        QTimer.singleShot(2000, self._reset_camera_copy_button)
+
+    def _reset_camera_copy_button(self) -> None:
+        self.copy_camera_diagnostics.setText("複製診斷資訊")
 
     def _screen_clicked(self, index: int) -> None:
         entries = self.screen_catalog.entries()
