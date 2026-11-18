@@ -13,6 +13,21 @@ from pathlib import Path
 from typing import Protocol, cast
 
 CAPABILITIES = ("microphone", "webcam")
+MEETING_PACKAGED_APP_PREFIXES = ("MSTeams_", "MicrosoftTeams_")
+MEETING_EXECUTABLE_NAMES = frozenset(
+    {
+        "ms-teams.exe",
+        "teams.exe",
+        "zoom.exe",
+        "cpthost.exe",
+        "webexmta.exe",
+        "ciscocollabhost.exe",
+        "atmgr.exe",
+        "lync.exe",
+        "skype.exe",
+        "slack.exe",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,8 +124,16 @@ def _normalized_executable(value: str | Path) -> str:
     return ntpath.normcase(ntpath.normpath(text))
 
 
+def _is_meeting_microphone_user(identity: str) -> bool:
+    normalized = identity.strip().strip('"').replace("#", "\\").replace("/", "\\")
+    packaged_name = normalized.split("\\", 1)[0]
+    if any(packaged_name.startswith(prefix) for prefix in MEETING_PACKAGED_APP_PREFIXES):
+        return True
+    return ntpath.basename(normalized).casefold() in MEETING_EXECUTABLE_NAMES
+
+
 def camera_in_use(reader: RegistryReader, *, self_executable: Path | str = sys.executable) -> bool:
-    """Return whether a different app has an active camera or microphone record."""
+    """Return whether another app's active device record indicates a meeting."""
 
     own = _normalized_executable(self_executable)
     for capability in CAPABILITIES:
@@ -118,6 +141,8 @@ def camera_in_use(reader: RegistryReader, *, self_executable: Path | str = sys.e
             if entry.start == 0 or entry.stop != 0:
                 continue
             if _normalized_executable(entry.identity) == own:
+                continue
+            if capability == "microphone" and not _is_meeting_microphone_user(entry.identity):
                 continue
             return True
     return False

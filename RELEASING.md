@@ -4,7 +4,7 @@
 建立 repository、設定 remote、commit、tag、push 與公開 release 都由維護者明確執行。
 
 目前版本的唯一來源為 `src/desk_sentry/__init__.py` 的 `__version__`，
-setuptools metadata、bundle 建置資訊及安裝程式都由它衍生。目前版本為 `2.0.1`。
+setuptools metadata、bundle 建置資訊及安裝程式都由它衍生。目前版本為 `2.0.2`。
 正式版顯示純版本，未正式發佈的本機建置顯示 `版本+短commit[.dirty]`。
 
 ## 發佈前

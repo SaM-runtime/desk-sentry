@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import re
 import threading
 import time
@@ -53,10 +54,20 @@ def _diagnostic_trace(exc: Exception) -> str:
     return "\n".join(lines)
 
 
+def _diagnostic_token(value: object) -> str | None:
+    return (
+        value
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,95}", value)
+        else None
+    )
+
+
 THUMB_MAX_SIZE = (240, 160)  # width, height: 10 history thumbnails stay under 1 MB
 THUMB_MIN_INTERVAL = 3.0
 _THUMB_PADDING = 0.2
 ERROR_RETRY_SECONDS = 2.0
+CAMERA_FATAL_RETRY_INITIAL = 30.0
+CAMERA_FATAL_RETRY_MAX = 300.0
 _PREVIEW_MAX_WIDTH = 960
 # Face work per analysis step is bounded; recognised people are re-checked
 # rarely, unrecognised ones often (they may turn towards the camera).
@@ -114,6 +125,7 @@ class CameraSource(Protocol):
     index: int
     connected: bool
     fps: float
+    nominal_fps: float
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
@@ -157,6 +169,7 @@ class Snapshot:
     alert_level: Level | None = None  # strongest level of the people alerting
     level_raised: bool = False
     camera_fps: float = 0.0
+    nominal_fps: float = 0.0
     analysis_fps: float = 0.0
     latency_ms: float = 0.0
     raw_status: Status | None = None
@@ -165,6 +178,11 @@ class Snapshot:
     evade_near: bool = False
     alert_ts: float | None = None
     camera_backend: str = "exclusive"
+    backend_detail: str | None = None
+    subtype: str | None = None
+    width: int = 0
+    height: int = 0
+    last_camera_error: str | None = None
     # Acknowledged only after the camera's stop/release has completed.
     pause_reason: str | None = None
     pause_request: int = 0
@@ -248,8 +266,25 @@ class Engine:
         self._on_zone = on_zone_calibrated
         self._camera_factory = camera_factory
         self._camera_mode = settings.camera_mode
+        self._camera_id = settings.camera_id
+        self._camera_name = settings.camera_name
         self._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
-        self._reported_backend: tuple[str, str | None] | None = None
+        self._camera_backend_detail: str | None = None
+        self._camera_subtype: str | None = None
+        self._camera_width = 0
+        self._camera_height = 0
+        self._camera_fps = 0.0
+        self._camera_nominal_fps = 0.0
+        self._last_camera_error: str | None = None
+        self._reported_backend: tuple[str, str | None, str | None] | None = None
+        self._reported_formats: set[tuple[str | None, int, int]] = set()
+        self._exclusive_allowed = threading.Event()
+        self._exclusive_allowed.set()
+        self._camera_unresponsive = False
+        self._camera_release_failed = False
+        self._camera_retry_at = 0.0
+        self._camera_retry_delay = CAMERA_FATAL_RETRY_INITIAL
+        self._discarded_camera_identity: tuple[int, str, str, str] | None = None
         self._lock = threading.Lock()
         self._settings = settings
         self._pause_reason = "manual"
@@ -287,28 +322,97 @@ class Engine:
     def _emit_snapshot(self, snapshot: Snapshot) -> None:
         self._update_health()
         if self._camera is not None:
-            backend = getattr(self._camera, "backend_name", "exclusive")
-            self._camera_backend = backend if backend in ("shared", "exclusive") else "pending"
-            failure = getattr(self._camera, "failure_reason", None)
-            failure = (
-                failure
-                if isinstance(failure, str)
-                and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,95}", failure)
-                else None
-            )
-            record = (self._camera_backend, failure)
+            self._capture_camera_metadata(self._camera)
+            failure = _diagnostic_token(getattr(self._camera, "failure_reason", None))
+            if failure is not None:
+                self._last_camera_error = failure
+            record = (self._camera_backend, self._camera_backend_detail, failure)
             if self.diagnostics is not None and record != self._reported_backend:
                 self.diagnostics.write(
-                    "camera_backend", backend=record[0], failure_reason=record[1]
+                    "camera_backend",
+                    backend=self._camera_backend,
+                    backend_detail=self._camera_backend_detail,
+                    subtype=self._camera_subtype,
+                    width=self._camera_width,
+                    height=self._camera_height,
+                    nominal_fps=round(self._camera_nominal_fps, 1),
+                    failure_reason=failure,
                 )
                 self._reported_backend = record
+            format_key = (
+                self._camera_subtype,
+                self._camera_width,
+                self._camera_height,
+            )
+            if (
+                self.diagnostics is not None
+                and self._camera_subtype is not None
+                and self._camera_width > 0
+                and self._camera_height > 0
+                and format_key not in self._reported_formats
+            ):
+                self.diagnostics.write(
+                    "camera_format",
+                    backend=self._camera_backend,
+                    backend_detail=self._camera_backend_detail,
+                    subtype=self._camera_subtype,
+                    width=self._camera_width,
+                    height=self._camera_height,
+                    nominal_fps=round(self._camera_nominal_fps, 1),
+                )
+                self._reported_formats.add(format_key)
+        health_state = HealthState.DEGRADED if self._camera_unresponsive else self.health.state
+        health_reason = "camera_unresponsive" if self._camera_unresponsive else self.health.reason
+        if self._camera_release_failed:
+            health_state = HealthState.DEGRADED
+            health_reason = "camera_release_failed"
+            if snapshot.status is Status.PAUSED:
+                snapshot = replace(snapshot, pause_reason=None, pause_request=0)
         self._on_snapshot(
             replace(
                 snapshot,
-                health_state=self.health.state,
-                health_reason=self.health.reason or None,
+                health_state=health_state,
+                health_reason=health_reason or None,
                 camera_backend=self._camera_backend,
+                backend_detail=self._camera_backend_detail,
+                subtype=self._camera_subtype,
+                width=self._camera_width,
+                height=self._camera_height,
+                camera_fps=self._camera_fps,
+                nominal_fps=self._camera_nominal_fps,
+                last_camera_error=self._last_camera_error,
             )
+        )
+
+    def _capture_camera_metadata(self, camera: CameraSource) -> None:
+        backend = getattr(camera, "backend_name", "exclusive")
+        self._camera_backend = (
+            backend if backend in ("shared", "exclusive", "yielded", "pending") else "pending"
+        )
+        detail = _diagnostic_token(getattr(camera, "backend_detail", None))
+        self._camera_backend_detail = detail if detail in ("winrt", "dshow") else None
+        self._camera_subtype = _diagnostic_token(getattr(camera, "subtype", None))
+        width = getattr(camera, "width", 0)
+        height = getattr(camera, "height", 0)
+        fps = getattr(camera, "fps", 0.0)
+        nominal_fps = getattr(camera, "nominal_fps", 0.0)
+        self._camera_width = width if type(width) is int and width > 0 else 0
+        self._camera_height = height if type(height) is int and height > 0 else 0
+        self._camera_fps = (
+            float(fps)
+            if isinstance(fps, (int, float))
+            and not isinstance(fps, bool)
+            and math.isfinite(fps)
+            and fps >= 0
+            else 0.0
+        )
+        self._camera_nominal_fps = (
+            float(nominal_fps)
+            if isinstance(nominal_fps, (int, float))
+            and not isinstance(nominal_fps, bool)
+            and math.isfinite(nominal_fps)
+            and nominal_fps >= 0
+            else 0.0
         )
 
     def _record_error(self, exc: Exception) -> None:
@@ -341,6 +445,15 @@ class Engine:
     def set_people(self, people: PeopleSnapshot) -> None:
         self._people = people  # immutable snapshot; a reference swap is atomic
 
+    def set_exclusive_allowed(self, allowed: bool) -> None:
+        """Allow Camera's compatibility fallback without sharing mutable UI state."""
+
+        if allowed:
+            self._exclusive_allowed.set()
+        else:
+            self._exclusive_allowed.clear()
+        self._wake.set()
+
     def apply(self, settings: Settings, *, pause_reason: str = "manual") -> int:
         with self._lock:
             self._settings = settings
@@ -358,11 +471,36 @@ class Engine:
     def _close_camera(self) -> None:
         if self._camera is not None:
             self._camera_closing = True
-            self._camera.stop()
+            self._capture_camera_metadata(self._camera)
+            fatal_error = _diagnostic_token(getattr(self._camera, "fatal_error", None))
+            worker_alive = getattr(self._camera, "worker_alive", True)
+            try:
+                if fatal_error is None or worker_alive is not False:
+                    self._camera.stop()
+                else:
+                    self._last_camera_error = fatal_error
+            except Exception:
+                # An ended reader with a failed release cannot acknowledge a
+                # handoff. A still-running operation retains the retry path.
+                if (
+                    getattr(self._camera, "release_failed", False) is not True
+                    or getattr(self._camera, "worker_alive", True) is not False
+                ):
+                    raise
+            self._remember_release_failure(self._camera)
             self._camera = None
         self._camera_closing = False
         self._tracker.reset()
         self._alerts.reset()
+
+    def _remember_release_failure(self, camera: CameraSource) -> None:
+        if getattr(camera, "release_failed", False) is True:
+            self._camera_release_failed = True
+            self._last_camera_error = (
+                _diagnostic_token(getattr(camera, "failure_reason", None))
+                or _diagnostic_token(getattr(camera, "fatal_error", None))
+                or "CameraReleaseError"
+            )
 
     def _sync_settings(self) -> Settings:
         with self._lock:
@@ -383,6 +521,8 @@ class Engine:
             if self._camera is not None and (
                 self._camera.index != settings.camera_index
                 or self._camera_mode != settings.camera_mode
+                or self._camera_id != settings.camera_id
+                or self._camera_name != settings.camera_name
             ):
                 self._close_camera()
         return settings
@@ -439,6 +579,34 @@ class Engine:
                 self._emit_snapshot(Snapshot(Status.ERROR))
                 self._stop.wait(ERROR_RETRY_SECONDS)
 
+    def _discard_fatal_camera(self, state: _LoopState, error: str, now: float) -> None:
+        camera = self._camera
+        if camera is not None:
+            self._capture_camera_metadata(camera)
+            self._remember_release_failure(camera)
+            self._discarded_camera_identity = (
+                camera.index,
+                self._camera_id,
+                self._camera_name,
+                self._camera_mode,
+            )
+        self._camera = None
+        self._camera_closing = False
+        self._tracker.reset()
+        self._alerts.reset()
+        state.reset()
+        self.error_count += 1
+        self._last_camera_error = error
+        self._camera_unresponsive = True
+        self._camera_retry_at = now + self._camera_retry_delay
+        self._camera_retry_delay = min(self._camera_retry_delay * 2.0, CAMERA_FATAL_RETRY_MAX)
+        if self.diagnostics is not None:
+            # A fatal camera record contains only the exception type. Driver
+            # messages can include device identifiers or private paths.
+            self.diagnostics.write("error", error=error)
+        self._emit_snapshot(Snapshot(Status.NO_CAMERA))
+        state.last_emit = now
+
     def _step(self, state: _LoopState) -> None:
         settings = self._sync_settings()
         if self._camera_closing:
@@ -464,13 +632,43 @@ class Engine:
         self.health.resume()
 
         if self._camera is None:
+            now = time.monotonic()
+            camera_identity = (
+                settings.camera_index,
+                settings.camera_id,
+                settings.camera_name,
+                settings.camera_mode,
+            )
+            if (
+                self._camera_unresponsive
+                and self._discarded_camera_identity is not None
+                and camera_identity != self._discarded_camera_identity
+            ):
+                self._camera_unresponsive = False
+                self._camera_retry_at = 0.0
+                self._camera_retry_delay = CAMERA_FATAL_RETRY_INITIAL
+                self._discarded_camera_identity = None
+            if self._camera_unresponsive and now < self._camera_retry_at:
+                if now - state.last_emit >= 0.5:
+                    self._emit_snapshot(Snapshot(Status.NO_CAMERA))
+                    state.last_emit = now
+                self._wake.wait(min(1.0, self._camera_retry_at - now))
+                self._wake.clear()
+                return
             self._camera_mode = settings.camera_mode
+            camera_id = settings.camera_id
+            self._camera_id = camera_id
+            camera_name = settings.camera_name
+            self._camera_name = camera_name
             self._camera = (
                 self._camera_factory(settings.camera_index)
                 if self._camera_factory is not None
                 else Camera(
                     settings.camera_index,
+                    camera_id=camera_id,
+                    camera_name=camera_name,
                     mode="exclusive" if settings.camera_mode == "exclusive" else "auto",
+                    exclusive_allowed=self._exclusive_allowed.is_set,
                 )
             )
             self._camera.start()
@@ -485,6 +683,11 @@ class Engine:
                     stationary_mute_seconds=settings.stationary_mute_seconds,
                 )
         camera = self._camera
+        fatal_error = _diagnostic_token(getattr(camera, "fatal_error", None))
+        worker_alive = getattr(camera, "worker_alive", True)
+        if fatal_error is not None and worker_alive is False:
+            self._discard_fatal_camera(state, fatal_error, time.monotonic())
+            return
         state.seq, frame = camera.latest(state.seq, timeout=0.5)
         now = time.monotonic()
         if frame is None:
@@ -509,6 +712,12 @@ class Engine:
                 state.last_emit = now
             return
 
+        self._camera_release_failed = False
+        if self._camera_unresponsive:
+            self._camera_unresponsive = False
+            self._camera_retry_at = 0.0
+            self._camera_retry_delay = CAMERA_FATAL_RETRY_INITIAL
+            self._discarded_camera_identity = None
         self.health.frame()
 
         if not state.camera_ok:

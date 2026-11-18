@@ -252,10 +252,25 @@ def test_winrt_adapter_requests_shared_cpu_video_and_returns_bgr(monkeypatch):
     settings = SimpleNamespace()
     types = {
         "DeviceInformation": SimpleNamespace(
-            find_all_async=lambda _kind: Done([SimpleNamespace(id="device-0")])
+            find_all_async=lambda _kind: Done([SimpleNamespace(id="device-0", name="USB Camera")])
         ),
         "DeviceClass": SimpleNamespace(VIDEO_CAPTURE=4),
         "AsyncStatus": SimpleNamespace(STARTED=0),
+        "MediaFrameSourceGroup": SimpleNamespace(
+            find_all_async=lambda: Done(
+                [
+                    SimpleNamespace(
+                        id="group-0",
+                        source_infos=[
+                            SimpleNamespace(
+                                source_kind=1,
+                                device_information=SimpleNamespace(id="device-0"),
+                            )
+                        ],
+                    )
+                ]
+            )
+        ),
         "MediaCaptureInitializationSettings": lambda: settings,
         "MediaCaptureSharingMode": SimpleNamespace(SHARED_READ_ONLY=1),
         "StreamingCaptureMode": SimpleNamespace(VIDEO=2),
@@ -375,6 +390,13 @@ def test_exclusive_release_failure_is_sticky_and_stop_never_acknowledges():
 
 
 def test_shared_initialization_timeout_cancels_before_returning(monkeypatch):
+    class Completed:
+        def wait(self, _timeout):
+            return 1
+
+        def get(self):
+            return []
+
     class Pending:
         def __init__(self):
             self.cancelled = False
@@ -392,6 +414,7 @@ def test_shared_initialization_timeout_cancels_before_returning(monkeypatch):
     monkeypatch.setattr(
         "desk_sentry.camera_shared._winrt_types",
         lambda: {
+            "MediaFrameSourceGroup": SimpleNamespace(find_all_async=Completed),
             "DeviceInformation": SimpleNamespace(find_all_async=lambda _kind: pending),
             "DeviceClass": SimpleNamespace(VIDEO_CAPTURE=4),
             "AsyncStatus": SimpleNamespace(STARTED=0),

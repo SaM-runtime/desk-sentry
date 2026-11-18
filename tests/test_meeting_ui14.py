@@ -7,9 +7,10 @@ from unittest.mock import Mock
 import pytest
 from pytestqt.qtbot import QtBot
 
-from desk_sentry.app import DeskSentryApp, _diagnostics_settings
+from desk_sentry.app import DeskSentryApp, _diagnostics_settings, _ObservedEvadePlan
 from desk_sentry.config import Settings, load
 from desk_sentry.engine import Snapshot
+from desk_sentry.health import HealthState
 from desk_sentry.sentry import Status
 from desk_sentry.ui.main_window import MainWindow
 from test_app_hide04 import app_with
@@ -33,6 +34,10 @@ class EngineRecorder:
         self.settings: Settings | None = None
         self.reason: str | None = None
         self.request = 0
+        self.exclusive_allowed = True
+
+    def set_exclusive_allowed(self, allowed: bool) -> None:
+        self.exclusive_allowed = allowed
 
     def apply(self, settings: Settings, *, pause_reason: str) -> int:
         self.settings = settings
@@ -43,16 +48,33 @@ class EngineRecorder:
 
 def controller(settings: Settings, *, hour: int = 12) -> DeskSentryApp:
     app = DeskSentryApp.__new__(DeskSentryApp)
-    app.window = SimpleNamespace(settings=settings, set_pause_reason=Mock())
+    app.window = SimpleNamespace(
+        settings=settings,
+        set_pause_reason=Mock(),
+        set_camera_status=Mock(),
+        set_camera_diagnostics=Mock(),
+    )
     app._wall_now = lambda: datetime(2026, 11, 5, hour)
     app._locked = False
     app._meeting_active = False
     app._manual_yield = False
     app._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
+    app._camera_backend_detail = ""
+    app._camera_subtype = ""
+    app._camera_width = 0
+    app._camera_height = 0
+    app._camera_fps = 0.0
+    app._camera_nominal_fps = 0.0
+    app._last_camera_error = None
+    app._camera_unresponsive = False
+    app._camera_release_failed = False
+    app._build_info = SimpleNamespace(display_version="test", version="test")
     app._pause_reason = None
     app._pause_ack_reason = None
     app._effective_armed = settings.armed
     app._last_status = Status.CLEAR
+    app._health_state = HealthState.OK
+    app._evade_plan = _ObservedEvadePlan()
     app.engine = EngineRecorder()
     app._schedule_timer = TimerRecorder()
     app._render_tray = Mock()

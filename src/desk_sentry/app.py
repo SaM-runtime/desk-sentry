@@ -6,12 +6,14 @@ import argparse
 import logging
 import math
 import os
+import platform
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import datetime
+from functools import cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -64,6 +66,8 @@ _NEW_SETTINGS_OUTSIDE_DIAGNOSTICS = frozenset(
         "away_action",
         "away_minutes",
         "camera_mode",
+        "camera_id",
+        "camera_name",
         "auto_yield_camera",
         "hide_hotkey_style",
         "pause_when_locked",
@@ -94,6 +98,33 @@ _NEW_SETTINGS_OUTSIDE_DIAGNOSTICS = frozenset(
 def _diagnostics_settings(settings: Settings) -> dict[str, object]:
     """Keep the existing settings-log schema; only paused.reason is added by task 05."""
     return {k: v for k, v in asdict(settings).items() if k not in _NEW_SETTINGS_OUTSIDE_DIAGNOSTICS}
+
+
+def _execution_mode(executable: Path | None = None) -> str:
+    """Describe how Desk Sentry was launched without exposing its path."""
+
+    runtime = Path(sys.executable) if executable is None else executable
+    runtime_root = runtime.resolve().parent.parent
+    if (runtime_root / "unins000.exe").is_file():
+        return "安裝版"
+    if (runtime_root / "啟動 Desk Sentry.cmd").is_file():
+        return "免安裝"
+    return "原始碼"
+
+
+@cache
+def _process_execution_mode() -> str:
+    """Classify the fixed runtime once, outside repeated status work."""
+    return _execution_mode()
+
+
+def _error_type(value: str | None) -> str | None:
+    """Accept an exception type only; never copy an error message into diagnostics."""
+
+    if value is None:
+        return None
+    candidate = value.rsplit(".", 1)[-1]
+    return candidate if candidate.isidentifier() else "UnknownError"
 
 
 def model_path() -> Path:
@@ -217,6 +248,15 @@ class DeskSentryApp:
         self._manual_yield = False
         self._camera_mode = settings.camera_mode
         self._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
+        self._camera_backend_detail = ""
+        self._camera_subtype = ""
+        self._camera_width = 0
+        self._camera_height = 0
+        self._camera_fps = 0.0
+        self._camera_nominal_fps = 0.0
+        self._last_camera_error: str | None = None
+        self._camera_unresponsive = False
+        self._camera_release_failed = False
         self._effective_armed = settings.armed
         self._pause_reason: str | None = None
         self._pause_ack_reason: str | None = None
@@ -380,12 +420,9 @@ class DeskSentryApp:
             self._session_changed, self._apply_monitoring
         )
         self._session_notifications.install(app, int(self.window.winId()))
-        self._apply_monitoring()
         self._apply_diagnostics(settings)
         self._sync_discreet_presentation(settings)
-        self.engine.start()
-        self._meeting_monitor = meeting.MeetingMonitor(self._bridge.meeting.emit)
-        self._meeting_monitor.start()
+        self._start_camera_monitoring()
         app.aboutToQuit.connect(self.shutdown_now)
         app.aboutToQuit.connect(self._meeting_monitor.stop)
         app.aboutToQuit.connect(self._session_notifications.close)
@@ -402,7 +439,7 @@ class DeskSentryApp:
 
     # ------------------------------------------------------------ callbacks
     def _on_settings(self, settings: Settings) -> None:
-        previous_camera_mode = getattr(self, "_camera_mode", settings.camera_mode)
+        previous_camera_mode = self._camera_mode
         self._camera_mode = settings.camera_mode
         if settings.camera_mode != previous_camera_mode:
             self._camera_backend = "pending" if settings.camera_mode == "auto" else "exclusive"
@@ -496,7 +533,7 @@ class DeskSentryApp:
     def _sync_discreet_presentation(self, settings: Settings) -> None:
         if hasattr(self, "_compact_action"):
             self._compact_action.setVisible(not settings.discreet)
-        previous = getattr(self, "_discreet_active", False)
+        previous = self._discreet_active
         if not settings.discreet and not previous:
             return
         if settings.discreet:
@@ -563,8 +600,8 @@ class DeskSentryApp:
     def mark(self, kind: str) -> None:
         if kind in ("false_alarm", "real"):
             if self.window.settings.diagnostics:
-                alert_ts = getattr(self, "_last_alert_ts", None)
-                now = getattr(self, "_wall_now", datetime.now)().timestamp()
+                alert_ts = self._last_alert_ts
+                now = self._wall_now().timestamp()
                 self._diagnostics.write(
                     "marker",
                     marker=kind,
@@ -606,14 +643,27 @@ class DeskSentryApp:
         self._meeting_active = active
         self._apply_monitoring()
 
+    def _start_camera_monitoring(self) -> None:
+        """Synchronize meeting state before starting any camera worker."""
+
+        self._meeting_monitor = meeting.MeetingMonitor(self._bridge.meeting.emit)
+        self._meeting_monitor.poll_once()
+        # The monitor's signal is queued onto Qt. Apply its initial state
+        # synchronously so an already-active meeting wins before Camera starts.
+        self._meeting_active = self._meeting_monitor.active
+        self._apply_monitoring()
+        self.engine.start()
+        self._meeting_monitor.start()
+
     def toggle_camera_yield(self) -> None:
         """Keep the camera released until the user explicitly restores it."""
 
-        self._manual_yield = not getattr(self, "_manual_yield", False)
+        self._manual_yield = not self._manual_yield
         self._apply_monitoring()
 
     def _apply_monitoring(self) -> None:
         settings = self.window.settings
+        self.engine.set_exclusive_allowed(not (self._meeting_active and settings.auto_yield_camera))
         now = self._wall_now()
         in_schedule = not settings.schedule_enabled or schedule.in_window(
             now,
@@ -621,20 +671,20 @@ class DeskSentryApp:
             settings.schedule_end,
             settings.schedule_days,
         )
-        previous_reason = getattr(self, "_pause_reason", None)
-        camera_backend = getattr(self, "_camera_backend", "exclusive")
+        previous_reason = self._pause_reason
+        camera_backend = self._camera_backend
         if not settings.armed:
             reason = "manual"
-        elif getattr(self, "_manual_yield", False):
+        elif self._manual_yield:
             reason = "manual_yield"
         elif self._locked and settings.pause_when_locked:
             reason = "locked"
         elif not in_schedule:
             reason = "schedule"
         elif (
-            getattr(self, "_meeting_active", False)
-            and getattr(settings, "auto_yield_camera", True)
-            and camera_backend == "exclusive"
+            self._meeting_active
+            and settings.auto_yield_camera
+            and camera_backend in ("exclusive", "yielded")
         ):
             reason = "meeting"
         else:
@@ -645,9 +695,7 @@ class DeskSentryApp:
             self._pause_ack_reason = None
         if not self._effective_armed:
             self._health_state = HealthState.OK
-            evade_plan = getattr(self, "_evade_plan", None)
-            if evade_plan is not None:
-                evade_plan.cancel()
+            self._evade_plan.cancel()
         pause_request = self.engine.apply(
             replace(settings, armed=self._effective_armed),
             pause_reason=self._pause_reason or "manual",
@@ -672,21 +720,20 @@ class DeskSentryApp:
             next_start=boundary if self._pause_reason == "schedule" else None,
             acknowledged=(
                 self._pause_reason not in ("meeting", "manual_yield")
-                or getattr(self, "_pause_ack_reason", None) == self._pause_reason
+                or self._pause_ack_reason == self._pause_reason
             ),
         )
         if settings.discreet and not self._effective_armed:
             self.discreet_cue.update_status(Status.PAUSED)
         status = (self._last_status or Status.PAUSED) if self._effective_armed else Status.PAUSED
         self._render_tray(settings, status)
+        self._refresh_camera_presentation()
 
     def _record_stats(self, snap: Snapshot) -> None:
-        stats = getattr(self, "stats", None)
-        if stats is None:
-            return
+        stats = self.stats
         now = self._wall_now()
         day_changed = self._stats_day != now.date()
-        hour_changed = getattr(self, "_stats_hour", None) != now.hour
+        hour_changed = self._stats_hour != now.hour
         if day_changed:
             stats.prune(now=now)
             self._stats_day = now.date()
@@ -696,52 +743,77 @@ class DeskSentryApp:
             self._history_window.refresh()
 
     def _log_stats_error(self, error: Exception) -> None:
-        if not getattr(self, "_stats_error_logged", False):
+        if not self._stats_error_logged:
             self._stats_error_logged = True
             self._log("stats_error", error=str(error))
 
     def _on_snapshot(self, snap: Snapshot) -> None:
         settings = self.window.settings
-        backend = getattr(snap, "camera_backend", "exclusive")
-        if backend not in ("pending", "shared", "exclusive"):
+        backend = snap.camera_backend
+        if backend not in ("pending", "shared", "exclusive", "yielded"):
             backend = "pending"
-        backend_changed = backend != getattr(self, "_camera_backend", "exclusive")
+        backend_changed = backend != self._camera_backend
         self._camera_backend = backend
-        if backend_changed and getattr(self, "_meeting_active", False):
-            self._apply_monitoring()
-            settings = self.window.settings
+        self._camera_backend_detail = snap.backend_detail or ""
+        self._camera_subtype = snap.subtype or ""
+        self._camera_width = snap.width
+        self._camera_height = snap.height
+        self._camera_fps = snap.camera_fps
+        self._camera_nominal_fps = snap.nominal_fps
+        self._last_camera_error = _error_type(snap.last_camera_error)
+        self._camera_unresponsive = (
+            snap.status is Status.NO_CAMERA
+            or snap.health_reason
+            in (
+                "camera_unresponsive",
+                "no_frame",
+            )
+            or (not self._effective_armed and snap.status is Status.ERROR)
+        )
         acknowledged_reason = getattr(snap, "pause_reason", None)
         acknowledged_request = getattr(snap, "pause_request", 0)
+        if snap.health_reason == "camera_release_failed":
+            self._camera_release_failed = True
+        elif self._effective_armed and snap.status is not Status.PAUSED:
+            self._camera_release_failed = False
+        if self._camera_release_failed:
+            self._pause_ack_reason = None
+            self.window.set_pause_reason(self._pause_reason, acknowledged=False)
         if (
             snap.status is Status.PAUSED
+            and not self._camera_release_failed
             and acknowledged_reason is not None
-            and acknowledged_reason == getattr(self, "_pause_reason", None)
-            and acknowledged_request == getattr(self, "_pause_request", 0)
+            and acknowledged_reason == self._pause_reason
+            and acknowledged_request == self._pause_request
         ):
             self._pause_ack_reason = acknowledged_reason
             self.window.set_pause_reason(acknowledged_reason, acknowledged=True)
             self._render_tray(settings, Status.PAUSED)
+        meeting_pause_needed = (
+            self._meeting_active
+            and settings.auto_yield_camera
+            and backend in ("exclusive", "yielded")
+        )
+        if backend_changed and ((self._pause_reason == "meeting") != meeting_pause_needed):
+            self._apply_monitoring()
+            settings = self.window.settings
+        else:
+            self._refresh_camera_presentation()
         if snap.status is Status.NOTICE and not settings.discreet:
             snap = replace(snap, status=Status.WATCHING)
-        effective = getattr(self, "_effective_armed", settings.armed)
+        effective = self._effective_armed
         if snap.status is Status.PAUSED and effective:
             # A stale "paused" frame emitted just before re-arming.
             return
         if not effective and snap.status is not Status.PAUSED:
             return  # queued analysis from just before an automatic/manual pause
         now = time.monotonic()
-        health_changed = snap.health_state is not getattr(self, "_health_state", HealthState.OK)
+        health_changed = snap.health_state is not self._health_state
         self._health_state = snap.health_state
         if snap.alert_started:
             self._last_alert_ts = (
-                snap.alert_ts
-                if snap.alert_ts is not None
-                else getattr(self, "_wall_now", datetime.now)().timestamp()
+                snap.alert_ts if snap.alert_ts is not None else self._wall_now().timestamp()
             )
-        if not hasattr(self, "_evade_plan"):
-            self._evade_plan = _ObservedEvadePlan()
-        if not hasattr(self, "_foreground_plan"):
-            self._foreground_plan = actions.ForegroundPlan()
         try:
             self._record_stats(snap)
         except Exception as error:
@@ -760,18 +832,16 @@ class DeskSentryApp:
         else:
             self._foreground_plan.clear()
         self._latest_snapshot = snap
-        away_plan = getattr(self, "_away_plan", None)
-        if away_plan is not None:
-            away_action = away_plan.update(
-                snap.raw_status or snap.status,
-                time.monotonic(),
-                action=settings.away_action,
-                minutes=settings.away_minutes,
-                target_apps=settings.target_apps,
-                last_input_age=actions.last_input_age,
-            )
-            if away_action is not None:
-                actions.run_action(away_action, settings.target_apps)
+        away_action = self._away_plan.update(
+            snap.raw_status or snap.status,
+            time.monotonic(),
+            action=settings.away_action,
+            minutes=settings.away_minutes,
+            target_apps=settings.target_apps,
+            last_input_age=actions.last_input_age,
+        )
+        if away_action is not None:
+            actions.run_action(away_action, settings.target_apps)
         display = (
             replace(
                 snap, frame=None, tracks=(), self_zone=None, alert_thumbnail=None, alert_face=None
@@ -850,8 +920,62 @@ class DeskSentryApp:
             self._render_tray(settings, snap.status)
 
     # ------------------------------------------------------------------ tray
+    def _camera_diagnostics_text(self) -> str:
+        settings = self.window.settings
+        resolution = (
+            f"{self._camera_width}x{self._camera_height}"
+            if self._camera_width > 0 and self._camera_height > 0
+            else "未知"
+        )
+        measured_fps = f"{self._camera_fps:.1f}" if self._camera_fps > 0 else "未知"
+        nominal_fps = f"{self._camera_nominal_fps:.1f}" if self._camera_nominal_fps > 0 else "未知"
+        return "\n".join(
+            (
+                f"版本：{self._build_info.version}",
+                f"Windows 版本：{platform.version()}",
+                f"執行方式：{_process_execution_mode()}",
+                f"camera_mode：{settings.camera_mode}",
+                f"backend：{self._camera_backend}",
+                f"backend_detail：{self._camera_backend_detail or '未知'}",
+                f"最後錯誤類型：{self._last_camera_error or '無'}",
+                f"格式：{self._camera_subtype or '未知'}",
+                f"解析度：{resolution}",
+                f"fps：實測 {measured_fps}／規格 {nominal_fps}",
+                f"會議中：{'是' if self._meeting_active else '否'}",
+                f"auto_yield：{'是' if settings.auto_yield_camera else '否'}",
+                f"低調模式：{'是' if settings.discreet else '否'}",
+            )
+        )
+
+    def _refresh_camera_presentation(self) -> None:
+        status_backend = (
+            "manual" if self._pause_reason in ("manual", "manual_yield") else self._camera_backend
+        )
+        if self._pause_reason in ("locked", "schedule"):
+            status_backend = self._pause_reason
+        self.window.set_camera_status(
+            status_backend,
+            backend_detail=self._camera_backend_detail,
+            subtype=self._camera_subtype,
+            width=self._camera_width,
+            height=self._camera_height,
+            fps=self._camera_fps,
+            last_error=self._last_camera_error,
+            meeting_active=self._meeting_active,
+            unresponsive=self._camera_unresponsive,
+            release_failed=self._camera_release_failed,
+            acknowledged=(
+                not self._camera_release_failed
+                and (
+                    self._pause_reason not in ("meeting", "manual_yield")
+                    or self._pause_ack_reason == self._pause_reason
+                )
+            ),
+        )
+        self.window.set_camera_diagnostics(self._camera_diagnostics_text())
+
     def _render_tray(self, settings: Settings, status: Status) -> None:
-        degraded = getattr(self, "_health_state", HealthState.OK) is HealthState.DEGRADED
+        degraded = self._health_state is HealthState.DEGRADED
         # Discreet mode keeps the recognizable app icon (a swapped icon confused
         # testers) but in its fixed colour, so the tray does not reveal alerts.
         icon = (
@@ -859,7 +983,7 @@ class DeskSentryApp:
             if settings.discreet
             else theme.app_icon(theme.STATUS_COLOR[Status.PAUSED if degraded else status])
         )
-        if getattr(self, "_available_update", None) is not None:
+        if self._available_update is not None:
             pixmap = icon.pixmap(32, 32)
             painter = QPainter(pixmap)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -872,7 +996,7 @@ class DeskSentryApp:
             painter.end()
             icon = QIcon(pixmap)
         self.tray.setIcon(icon)
-        release = getattr(self, "_available_update", None)
+        release = self._available_update
         if hasattr(self, "_update_action"):
             self._update_action.setText(
                 "有可用更新…"
@@ -884,13 +1008,13 @@ class DeskSentryApp:
             self._skip_update_action.setText("略過此更新" if settings.discreet else "略過此版本")
         if hasattr(self, "_quit_action"):
             self._quit_action.setText("結束 Desk Sentry")
-        reason = getattr(self, "_pause_reason", None)
+        reason = self._pause_reason
         reason_text = {
             "locked": "已暫停 · 電腦鎖定中",
             "schedule": "已暫停 · 非監看時段",
         }.get(reason or "")
         if reason in ("meeting", "manual_yield"):
-            if getattr(self, "_pause_ack_reason", None) != reason:
+            if self._pause_ack_reason != reason:
                 reason_text = "正在讓出攝影機"
             elif reason == "meeting":
                 reason_text = "已暫停 · 會議中（已讓出攝影機）"
@@ -910,7 +1034,7 @@ class DeskSentryApp:
             self._pause_info.setText(reason_text or "")
             self._pause_info.setVisible(reason_text is not None)
         if hasattr(self, "_yield_camera_action"):
-            yielding = getattr(self, "_manual_yield", False)
+            yielding = self._manual_yield
             self._yield_camera_action.setText("恢復使用攝影機" if yielding else "暫時讓出攝影機")
             self._yield_camera_action.setEnabled(settings.armed or yielding)
         self._arm_action.setText("暫停監看" if settings.armed else "開始監看")
@@ -1023,22 +1147,20 @@ class DeskSentryApp:
             actions.run_action(settings.action)
 
     def _restore_manual_cover(self) -> None:
-        previous = getattr(self, "_manual_cover_previous", None)
+        previous = self._manual_cover_previous
         self._manual_cover_previous = None
         if previous is not None:
             actions.restore_foreground(previous)
 
     def toggle_hidden_windows(self) -> None:
-        curtain = getattr(self, "curtain", None)
-        if curtain is not None and curtain.visible:
-            curtain.hide()
+        if self.curtain.visible:
+            self.curtain.hide()
             self._restore_manual_cover()
             return
-        hide_toggle = getattr(self, "_hide_toggle", None)
-        stored = hide_toggle.stored if hide_toggle is not None else {}
-        if stored or getattr(self, "_manual_cover_previous", None) is not None:
-            if stored and hide_toggle is not None:
-                hide_toggle.toggle(self.window.settings.target_apps)
+        stored = self._hide_toggle.stored
+        if stored or self._manual_cover_previous is not None:
+            if stored:
+                self._hide_toggle.toggle(self.window.settings.target_apps)
             self._restore_manual_cover()
             return
         cover = self._activate_cover(self.window.settings)

@@ -6,6 +6,23 @@ import pytest
 
 from test_packaging09 import _load_helper
 
+EXPECTED_PRUNE_PATTERNS = (
+    "cv2/opencv_videoio_ffmpeg*.dll",
+    "PySide6/opengl32sw.dll",
+    "PySide6/Qt6Quick*.dll",
+    "PySide6/Qt6Qml*.dll",
+    "PySide6/Qt6Labs*.dll",
+    "PySide6/Qt6Lottie*.dll",
+    "PySide6/Qt6Designer*.dll",
+    "PySide6/Qt6OpenGL*.dll",
+    "PySide6/QtOpenGL*.pyd",
+    "PySide6/QtQuick*.pyd",
+    "PySide6/QtQml*.pyd",
+    "PySide6/QtDesigner*.pyd",
+    "PySide6/resources/icudtl.dat",
+    "PySide6/translations/qtwebengine*",
+)
+
 
 @pytest.fixture
 def inputs(tmp_path, monkeypatch):
@@ -36,6 +53,26 @@ def inputs(tmp_path, monkeypatch):
         site.mkdir(parents=True)
         (site / "numpy").mkdir()
         (site / "numpy/__init__.py").write_text("# fake wheel")
+        unused_files = (
+            "cv2/opencv_videoio_ffmpeg500_64.dll",
+            "PySide6/opengl32sw.dll",
+            "PySide6/Qt6QuickControls2.dll",
+            "PySide6/Qt6Qml.dll",
+            "PySide6/Qt6LabsAnimation.dll",
+            "PySide6/Qt6Lottie.dll",
+            "PySide6/Qt6Designer.dll",
+            "PySide6/Qt6OpenGLWidgets.dll",
+            "PySide6/QtOpenGL.pyd",
+            "PySide6/QtQuick.pyd",
+            "PySide6/QtQml.pyd",
+            "PySide6/QtDesigner.pyd",
+            "PySide6/resources/icudtl.dat",
+            "PySide6/translations/qtwebengine_zh_TW.qm",
+        )
+        for relative in unused_files:
+            path = site / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"unused")
         (site / "tool.exe").write_bytes(b"unwanted wheel launcher")
         (site / "pip").mkdir()
 
@@ -67,10 +104,18 @@ def test_bundle_layout_and_official_executables_only(inputs, tmp_path):
     assert len(list((output / "models").glob("*.onnx"))) == 3
     assert not list(output.rglob("__pycache__"))
     assert not (output / "python/Lib/site-packages/pip").exists()
+    site = output / "python/Lib/site-packages"
+    assert not any(path for pattern in EXPECTED_PRUNE_PATTERNS for path in site.glob(pattern))
     assert sorted(p.relative_to(output).as_posix() for p in output.rglob("*.exe")) == [
         "python/python.exe",
         "python/pythonw.exe",
     ]
+
+
+def test_bundle_prune_patterns_cover_only_verified_unused_runtime_files() -> None:
+    helper = _load_helper()
+
+    assert helper.bundle_prune_patterns() == EXPECTED_PRUNE_PATTERNS
 
 
 def test_bad_python_hash_aborts_without_output(inputs, tmp_path):

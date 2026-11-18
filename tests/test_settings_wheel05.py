@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from desk_sentry.camera_shared import CameraInfo
 from desk_sentry.config import Settings
 from desk_sentry.ui.controls import SegmentedControl
 from desk_sentry.ui.main_window import MainWindow
@@ -74,7 +75,11 @@ def test_wheel_over_setting_scrolls_page_without_changing_value(qtbot, kind, foc
 
 
 def test_show_and_drawer_focus_page_root_but_tab_and_arrows_still_edit(qtbot):
-    window = MainWindow(Settings(), lambda _settings: None)
+    window = MainWindow(
+        Settings(),
+        lambda _settings: None,
+        list_cameras=lambda: [CameraInfo(0, "Built in"), CameraInfo(1, "USB")],
+    )
     qtbot.addWidget(window)
     window.show()
     QApplication.processEvents()
@@ -91,7 +96,9 @@ def test_show_and_drawer_focus_page_root_but_tab_and_arrows_still_edit(qtbot):
     assert window.focusWidget() is content
     qtbot.keyClick(content, Qt.Key.Key_Tab)
     assert window.focusWidget() is not content
-    window.camera.spin.setFocus(Qt.FocusReason.TabFocusReason)
-    before = window.camera.value()
-    qtbot.keyClick(window.camera.spin, Qt.Key.Key_Up)
-    assert window.camera.value() == before + 1
+    qtbot.waitUntil(window.camera.isEnabled)
+    window.camera.setFocus(Qt.FocusReason.TabFocusReason)
+    before = window.camera.currentIndex()
+    qtbot.keyClick(window.camera, Qt.Key.Key_Down)
+    assert window.camera.currentIndex() == before + 1
+    assert window.settings.camera_name == "USB"
