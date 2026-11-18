@@ -4,7 +4,7 @@
 版本遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。
 實際成品與驗證狀態以各版本 Release 為準。
 
-## [2.0.2] - 2026-11-10
+## [2.0.2] - 2026-11-18
 
 ### 新增
 
