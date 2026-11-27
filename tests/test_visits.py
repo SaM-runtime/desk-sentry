@@ -29,8 +29,41 @@ def _image(value: int = 120) -> np.ndarray:
     return image
 
 
-def _log(directory, clock=time.time) -> VisitLog:
-    return VisitLog(directory, protect=_protect, unprotect=_unprotect, clock=clock)
+def _log(directory, clock=time.time, *, save: bool = True) -> VisitLog:
+    log = VisitLog(directory, protect=_protect, unprotect=_unprotect, clock=clock)
+    log.configure(save=save, retention_days=RETENTION_DAYS)
+    return log
+
+
+def test_by_default_nothing_is_written_to_disk(tmp_path) -> None:
+    log = VisitLog(tmp_path, protect=_protect, unprotect=_unprotect)
+    assert log.can_save and not log.persistent
+    log.add(1, _image(), seated=False, taken_at=time.time())
+    assert len(log) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_saving_can_be_switched_on_and_off_at_any_time(tmp_path) -> None:
+    log = _log(tmp_path, save=False)
+    log.add(1, _image(), seated=False, taken_at=time.time())
+    log.configure(save=True, retention_days=7)
+    assert len(list(tmp_path.glob("*.dsv"))) == 1  # this session's photo is kept
+
+    log.configure(save=False, retention_days=7)
+    assert list(tmp_path.glob("*.dsv")) == []  # nothing left on disk
+    assert len(log) == 1  # still viewable until the app exits
+
+
+def test_shorter_retention_drops_older_photos_now(tmp_path) -> None:
+    now = time.time()
+    log = _log(tmp_path, clock=lambda: now)
+    log.add(1, _image(), seated=False, taken_at=now - 2 * 86400)
+    log.add(2, _image(), seated=False, taken_at=now - 3600)
+    log.configure(save=True, retention_days=1)
+    assert [v.taken_at for v in log.items()] == [now - 3600]
+    assert len(list(tmp_path.glob("*.dsv"))) == 1
+    log.configure(save=True, retention_days=99)  # not offered: falls back to default
+    assert log.retention_days == RETENTION_DAYS
 
 
 def test_photos_survive_a_restart_and_are_not_stored_in_plain_text(tmp_path) -> None:
@@ -90,8 +123,9 @@ def test_unseen_counts_only_photos_after_the_last_look(tmp_path) -> None:
 
 def test_without_dpapi_the_log_stays_in_memory(tmp_path) -> None:
     log = VisitLog(tmp_path, protect=None, unprotect=None)
+    log.configure(save=True, retention_days=7)
     log.add(1, _image(), seated=False, taken_at=time.time())
-    assert not log.persistent and len(log) == 1
+    assert not log.can_save and not log.persistent and len(log) == 1
     assert list(tmp_path.iterdir()) == []
 
 

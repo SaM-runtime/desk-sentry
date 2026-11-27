@@ -37,14 +37,44 @@ def test_advanced_settings_start_collapsed_and_expand_on_request(qtbot: QtBot) -
     assert not window.advanced_hint.isVisibleTo(window)
 
 
-def test_away_guard_switch_saves_and_explains_the_lock_interaction(qtbot: QtBot) -> None:
+def test_every_privacy_switch_starts_off() -> None:
+    s = Settings()
+    assert not s.away_guard
+    assert not s.away_guard_save
+    assert not s.away_guard_when_locked
+    assert not s.diagnostics
+    assert not s.update_check_enabled
+
+
+def test_away_guard_options_appear_only_once_the_guard_is_on(qtbot: QtBot) -> None:
     seen: list[Settings] = []
     window = _window(qtbot, Settings(), seen)
+    rows = (window.away_guard_save_row, window.away_guard_locked_row)
     assert not window.away_guard.isChecked()
-    assert window.pause_when_locked_notice.isHidden()
+    assert all(not row.isVisibleTo(window) for row in rows)
+    assert not window.away_guard_keep_row.isVisibleTo(window)
 
     window.away_guard.click()
     assert seen[-1].away_guard is True
+    assert all(row.isVisibleTo(window) for row in rows)
+    assert not window.away_guard_save.isChecked()  # saving is still opt-in
+    assert not window.away_guard_keep_row.isVisibleTo(window)
+
+    window.away_guard_save.click()
+    assert seen[-1].away_guard_save is True
+    assert window.away_guard_keep_row.isVisibleTo(window)
+    window.away_guard_keep_days.setCurrentIndex(window.away_guard_keep_days.findData("30"))
+    assert seen[-1].away_guard_keep_days == 30
+    assert "加密存在本機" in window.privacy_label.text()  # the footer never overstates privacy
+
+
+def test_watching_while_locked_is_its_own_switch(qtbot: QtBot) -> None:
+    seen: list[Settings] = []
+    window = _window(qtbot, Settings(away_guard=True), seen)
+    assert window.pause_when_locked_notice.isHidden()
+
+    window.away_guard_when_locked.click()
+    assert seen[-1].away_guard_when_locked is True
     assert not window.pause_when_locked_notice.isHidden()
     assert window.pause_when_locked_row.graphicsEffect() is not None  # shown as not applicable
 
@@ -83,11 +113,14 @@ def test_tray_can_leave_discreet_mode_without_finding_the_setting() -> None:
     app.show_current.assert_called_once()
 
 
-def test_away_guard_keeps_watching_while_the_computer_is_locked() -> None:
+def test_only_the_locked_switch_keeps_the_guard_watching_while_locked() -> None:
     from test_app_automation05 import EngineRecorder, TimerRecorder
 
-    for guard, expected in ((False, "locked"), (True, None)):
-        app = app_with(Settings(pause_when_locked=True, away_guard=guard))
+    cases = (((False, False), "locked"), ((True, False), "locked"), ((True, True), None))
+    for (guard, when_locked), expected in cases:
+        app = app_with(
+            Settings(pause_when_locked=True, away_guard=guard, away_guard_when_locked=when_locked)
+        )
         app.engine = EngineRecorder()
         app._schedule_timer = TimerRecorder()
         app._render_tray = Mock()

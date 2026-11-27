@@ -820,6 +820,45 @@ class MainWindow(QMainWindow):
                 "你離開座位時，有人靠近或坐到你的位子就拍一張照片",
             )
         )
+        # Each privacy-relevant part is its own switch, off by default, and only
+        # shown once the guard itself is on.
+        self.away_guard_save = Switch()
+        self.away_guard_save.setChecked(s.away_guard_save)
+        self.away_guard_save.toggled.connect(
+            lambda value: self._update(away_guard_save=bool(value))
+        )
+        self.away_guard_save_row = guard.add_row(
+            _setting_row(
+                "照片存到這台電腦",
+                self.away_guard_save,
+                "以你的 Windows 帳號加密。關閉時照片只留到程式結束，已存的檔案會刪除",
+                dependent=True,
+            )
+        )
+        self.away_guard_keep_days = _combo(
+            [(str(days), f"{days} 天") for days in (1, 3, 7, 30)], str(s.away_guard_keep_days)
+        )
+        self.away_guard_keep_days.currentIndexChanged.connect(
+            lambda _index: self._update(
+                away_guard_keep_days=int(self.away_guard_keep_days.currentData())
+            )
+        )
+        self.away_guard_keep_row = guard.add_row(
+            _setting_row("保留天數", self.away_guard_keep_days, "到期自動刪除", dependent=True)
+        )
+        self.away_guard_when_locked = Switch()
+        self.away_guard_when_locked.setChecked(s.away_guard_when_locked)
+        self.away_guard_when_locked.toggled.connect(
+            lambda value: self._update(away_guard_when_locked=bool(value))
+        )
+        self.away_guard_locked_row = guard.add_row(
+            _setting_row(
+                "鎖定電腦時也看守",
+                self.away_guard_when_locked,
+                "要防止別人趁你不在時偷用電腦，建議開啟，離開時按 Win+L",
+                dependent=True,
+            )
+        )
         self.open_visits_button = QPushButton("查看離座紀錄")
         self.open_visits_button.setObjectName("secondaryButton")
         self.open_visits_button.setFixedHeight(theme.D["control_height"])
@@ -827,13 +866,7 @@ class MainWindow(QMainWindow):
             lambda: self.on_open_visits() if self.on_open_visits else None
         )
         self.away_guard_detail_row = guard.add_row(
-            _setting_row(
-                "離座紀錄",
-                self.open_visits_button,
-                "照片加密存在這台電腦，7 天後自動刪除。離開時按 Win+L 鎖定電腦，看守照常進行",
-                dependent=True,
-                stacked=True,
-            )
+            _setting_row("離座紀錄", self.open_visits_button, dependent=True)
         )
         add_section("離座看守", guard, advanced=False)
 
@@ -1065,9 +1098,7 @@ class MainWindow(QMainWindow):
             lambda value: self._update(pause_when_locked=bool(value))
         )
         self.pause_when_locked_row = system.add_row(
-            _setting_row(
-                "電腦鎖定時暫停", self.pause_when_locked, "離座看守開啟時，鎖定也會繼續看守"
-            )
+            _setting_row("電腦鎖定時暫停", self.pause_when_locked, "已開啟「鎖定電腦時也看守」")
         )
         self.pause_when_locked_notice = _required_hint(self.pause_when_locked_row)
         self.diagnostics = Switch()
@@ -1769,14 +1800,34 @@ class MainWindow(QMainWindow):
         self._update(away_guard=bool(enabled))
 
     def _sync_away_guard_ui(self) -> None:
-        guard = self._settings.away_guard
-        if self.away_guard.isChecked() != guard:
-            self.away_guard.blockSignals(True)
-            self.away_guard.setChecked(guard)
-            self.away_guard.blockSignals(False)
-        self._set_dependency(self.away_guard_detail_row, guard)
-        self._set_dependency(self.pause_when_locked_row, not guard)
-        self.pause_when_locked_notice.setVisible(guard)
+        s = self._settings
+        for switch, value in (
+            (self.away_guard, s.away_guard),
+            (self.away_guard_save, s.away_guard_save),
+            (self.away_guard_when_locked, s.away_guard_when_locked),
+        ):
+            if switch.isChecked() != value:
+                switch.blockSignals(True)
+                switch.setChecked(value)
+                switch.blockSignals(False)
+        self.away_guard_keep_days.blockSignals(True)
+        self.away_guard_keep_days.setCurrentIndex(
+            max(0, self.away_guard_keep_days.findData(str(s.away_guard_keep_days)))
+        )
+        self.away_guard_keep_days.blockSignals(False)
+        # Progressive disclosure: the guard's options appear only once it is on.
+        for row in (self.away_guard_save_row, self.away_guard_locked_row):
+            row.setVisible(s.away_guard)
+        self.away_guard_keep_row.setVisible(s.away_guard and s.away_guard_save)
+        self.away_guard_detail_row.setVisible(s.away_guard or self._unseen_visits > 0)
+        self.privacy_label.setText(
+            "影像只在記憶體中處理；離座看守照片已加密存在本機。"
+            if s.away_guard and s.away_guard_save
+            else "影像只在記憶體中處理，不錄影、不存檔。"
+        )
+        locked_watch = s.away_guard and s.away_guard_when_locked
+        self._set_dependency(self.pause_when_locked_row, not locked_watch)
+        self.pause_when_locked_notice.setVisible(locked_watch)
 
     def set_unseen_visits(self, count: int) -> None:
         self._unseen_visits = max(0, int(count))
@@ -1788,6 +1839,7 @@ class MainWindow(QMainWindow):
         self.open_visits_button.setText(
             f"查看離座紀錄（{self._unseen_visits} 則新）" if self._unseen_visits else "查看離座紀錄"
         )
+        self.away_guard_detail_row.setVisible(self._settings.away_guard or self._unseen_visits > 0)
 
     def _sensitivity_changed(self, _index: int) -> None:
         value = str(self.sensitivity.currentData())

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import math
 import os
@@ -68,6 +69,9 @@ _NEW_SETTINGS_OUTSIDE_DIAGNOSTICS = frozenset(
         "away_action",
         "away_minutes",
         "away_guard",
+        "away_guard_save",
+        "away_guard_keep_days",
+        "away_guard_when_locked",
         "away_guard_seen_at",
         "camera_mode",
         "camera_id",
@@ -335,8 +339,11 @@ class DeskSentryApp:
             protect=dpapi.protect if dpapi.available() else None,
             unprotect=dpapi.unprotect if dpapi.available() else None,
         )
+        self.visits.configure(
+            save=settings.away_guard_save, retention_days=settings.away_guard_keep_days
+        )
         try:
-            self.visits.load()
+            self.visits.load()  # only reads when saving is switched on
         except OSError as error:
             logging.getLogger(__name__).info("Cannot read visit photos: %s", error)
         self.visits.on_change = self._visits_changed
@@ -482,6 +489,13 @@ class DeskSentryApp:
             self._set_mark_hotkey("real", settings.mark_real_hotkey)
         self._render_tray(settings, self._last_status or Status.PAUSED)
         if hasattr(self, "visits"):
+            was_saving = self.visits.persistent
+            self.visits.configure(
+                save=settings.away_guard_save, retention_days=settings.away_guard_keep_days
+            )
+            if self.visits.persistent and not was_saving:
+                with contextlib.suppress(OSError):
+                    self.visits.load()
             self._visits_changed()
         if hasattr(self, "_update_timer"):
             self._configure_updates()
@@ -777,7 +791,11 @@ class DeskSentryApp:
             reason = "manual"
         elif self._manual_yield:
             reason = "manual_yield"
-        elif self._locked and settings.pause_when_locked and not settings.away_guard:
+        elif (
+            self._locked
+            and settings.pause_when_locked
+            and not (settings.away_guard and settings.away_guard_when_locked)
+        ):
             reason = "locked"
         elif not in_schedule:
             reason = "schedule"

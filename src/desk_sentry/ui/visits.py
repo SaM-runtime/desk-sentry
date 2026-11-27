@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from desk_sentry.ui import theme
 from desk_sentry.ui.history import thumbnail_image
-from desk_sentry.visits import RETENTION_DAYS, Visit, VisitLog
+from desk_sentry.visits import Visit, VisitLog
 
 _COLUMNS = 3
 _PHOTO_WIDTH = 200
@@ -41,6 +41,14 @@ def visit_caption(visit: Visit, *, now: float | None = None) -> str:
     stamp = time.strftime("今天 %H:%M" if same_day else "%m/%d %H:%M", when)
     what = "坐到你的座位" if visit.seated else "靠近你的電腦"
     return f"{stamp} · {what}"
+
+
+def storage_note(log: VisitLog) -> str:
+    if log.persistent:
+        where = f"照片加密存在這台電腦，{log.retention_days} 天後自動刪除"
+    else:
+        where = "照片只在程式開著時保留，結束程式就會消失（可在設定開啟「照片存到這台電腦」）"
+    return f"{where}。最後一張常是你自己回座。"
 
 
 def visits_summary(count: int) -> str:
@@ -88,8 +96,7 @@ class VisitWindow(QWidget):
 
         self.summary = QLabel()
         self.summary.setStyleSheet(f"font-size: {theme.FONT_SIZES['title']}px; font-weight: 600;")
-        where = "只保存在這台電腦並加密" if log.persistent else "只在程式開著時保留"
-        self.note = QLabel(f"照片{where}，{RETENTION_DAYS} 天後自動刪除。最後一張常是你自己回座。")
+        self.note = QLabel()
         self.note.setWordWrap(True)
         self.note.setStyleSheet(f"color: {theme.TEXT_3}; font-size: {theme.FONT_SIZES['small']}px;")
         self.clear_button = QPushButton("全部刪除")
@@ -137,6 +144,7 @@ class VisitWindow(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
+        self.note.setText(storage_note(self._log))
         for card in self.cards:
             self._grid.removeWidget(card)
             card.deleteLater()

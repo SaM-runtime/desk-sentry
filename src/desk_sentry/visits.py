@@ -1,12 +1,11 @@
 """離座紀錄: photos of people who came to the desk while the user was away.
 
-Unlike alert thumbnails, these photos are only useful after the fact (the user
-comes back and wants to know who was at their computer), so they survive a
-restart. Each photo is stored as one file whose whole content (time stamp,
-"sat in your seat" flag and JPEG) is encrypted with Windows DPAPI for the
-current account. Photos expire after ``RETENTION_DAYS`` and at most
-``MAX_VISITS`` are kept. Without DPAPI (or without a directory) the log stays
-in memory only.
+By default the photos live in memory only and disappear when the app exits.
+Saving them is a separate opt-in (``configure(save=True)``): each photo is then
+stored as one file whose whole content (time stamp, "sat in your seat" flag and
+JPEG) is encrypted with Windows DPAPI for the current account. Photos expire
+after the chosen number of days and at most ``MAX_VISITS`` are kept. Without
+DPAPI (or without a directory) saving is unavailable.
 """
 
 from __future__ import annotations
@@ -25,7 +24,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
-RETENTION_DAYS = 7
+RETENTION_DAYS = 7  # default; the user can choose one of RETENTION_CHOICES
+RETENTION_CHOICES = (1, 3, 7, 30)
 MAX_VISITS = 60
 _MAGIC = b"DSV1"
 _SUFFIX = ".dsv"
@@ -52,8 +52,10 @@ class VisitLog:
         unprotect: Codec | None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        persistent = directory is not None and protect is not None and unprotect is not None
-        self._directory = directory if persistent else None
+        capable = directory is not None and protect is not None and unprotect is not None
+        self._store = directory if capable else None
+        self._save = False
+        self.retention_days = RETENTION_DAYS
         self._protect = protect
         self._unprotect = unprotect
         self._clock = clock
@@ -62,8 +64,43 @@ class VisitLog:
         self.on_change: Callable[[], None] | None = None
 
     @property
+    def can_save(self) -> bool:
+        """Encrypted saving is possible here (Windows DPAPI and a data folder)."""
+
+        return self._store is not None
+
+    @property
     def persistent(self) -> bool:
-        return self._directory is not None
+        """Photos are currently being written to disk."""
+
+        return self._save and self._store is not None
+
+    @property
+    def _directory(self) -> Path | None:
+        return self._store if self._save else None
+
+    def configure(self, *, save: bool, retention_days: int) -> None:
+        """Apply the user's choices.
+
+        Turning saving on writes the photos already taken this session; turning
+        it off deletes every saved file (the photos stay viewable until exit).
+        """
+
+        days = retention_days if retention_days in RETENTION_CHOICES else RETENTION_DAYS
+        retention_changed = days != self.retention_days
+        self.retention_days = days
+        was_saving = self.persistent
+        self._save = bool(save)
+        if self.persistent and not was_saving:
+            for visit in self._items.values():
+                self._write(visit)
+        elif was_saving and not self.persistent:
+            self._delete_all_files()
+        if retention_changed:
+            self.expire()
+
+    def _cutoff(self) -> float:
+        return self._clock() - self.retention_days * 86400
 
     # ------------------------------------------------------------- reading
     def load(self) -> None:
@@ -72,7 +109,7 @@ class VisitLog:
         directory = self._directory
         if directory is None or not directory.is_dir():
             return
-        cutoff = self._clock() - RETENTION_DAYS * 86400
+        cutoff = self._cutoff()
         for path in sorted(directory.glob(f"*{_SUFFIX}")):
             try:
                 if path.stat().st_mtime < cutoff:
@@ -120,19 +157,19 @@ class VisitLog:
         return key
 
     def clear(self) -> None:
-        keys = list(self._items)
         self._items.clear()
-        for key in keys:
-            self._delete_file(key)
-        directory = self._directory
+        self._delete_all_files()
+        self._changed()
+
+    def _delete_all_files(self) -> None:
+        directory = self._store
         if directory is not None and directory.is_dir():
             for path in directory.glob(f"*{_SUFFIX}"):
                 with contextlib.suppress(OSError):
                     path.unlink()
-        self._changed()
 
     def expire(self) -> None:
-        cutoff = self._clock() - RETENTION_DAYS * 86400
+        cutoff = self._cutoff()
         expired = [key for key, visit in self._items.items() if visit.taken_at < cutoff]
         for key in expired:
             del self._items[key]
