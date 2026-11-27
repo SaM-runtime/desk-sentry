@@ -102,6 +102,16 @@ class Settings:
     restore_after_alert: bool = False
     away_action: str = "none"
     away_minutes: int = 5
+    # 離座看守: photograph people who come to the desk while the user is away.
+    # Every privacy-relevant part is a separate opt-in and starts off.
+    away_guard: bool = False
+    # Keep the photos on disk (DPAPI-encrypted) instead of in memory until exit.
+    away_guard_save: bool = False
+    away_guard_keep_days: int = 7
+    # Keep watching while Windows is locked (overrides pause_when_locked).
+    away_guard_when_locked: bool = False
+    # Visit photos taken after this (wall-clock seconds) count as new.
+    away_guard_seen_at: float = 0.0
     mirror_corner: str = "top-right"
     mirror_width: int = 360
     # Numbers-only diagnostics log (boxes, scores, verdicts); never images.
@@ -169,6 +179,18 @@ class Settings:
         if s.hide_hotkey_style not in HIDE_HOTKEY_STYLES:
             s.hide_hotkey_style = "minimize"
         s.pause_when_locked = bool(s.pause_when_locked)
+        s.away_guard = s.away_guard if isinstance(s.away_guard, bool) else False
+        s.away_guard_save = s.away_guard_save if isinstance(s.away_guard_save, bool) else False
+        s.away_guard_when_locked = (
+            s.away_guard_when_locked if isinstance(s.away_guard_when_locked, bool) else False
+        )
+        if type(s.away_guard_keep_days) is not int or s.away_guard_keep_days not in (1, 3, 7, 30):
+            s.away_guard_keep_days = 7
+        try:
+            seen_at = float(s.away_guard_seen_at)
+            s.away_guard_seen_at = seen_at if math.isfinite(seen_at) and seen_at > 0 else 0.0
+        except (TypeError, ValueError):
+            s.away_guard_seen_at = 0.0
         s.schedule_enabled = bool(s.schedule_enabled)
         s.schedule_start = normalize_schedule_time(s.schedule_start, DEFAULT_SCHEDULE_START)
         s.schedule_end = normalize_schedule_time(s.schedule_end, DEFAULT_SCHEDULE_END)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import math
 import os
@@ -22,7 +23,7 @@ from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon, QWidget
 
-from desk_sentry import __version__, actions, config, meeting, schedule, startup
+from desk_sentry import __version__, actions, config, dpapi, meeting, schedule, startup
 from desk_sentry.build_info import get_build_info
 from desk_sentry.config import Settings
 from desk_sentry.detector import Box, PersonDetector
@@ -44,12 +45,14 @@ from desk_sentry.ui.main_window import MainWindow
 from desk_sentry.ui.mini_mirror import MiniMirror
 from desk_sentry.ui.overlays import EdgeFlashGroup, MirrorPopup
 from desk_sentry.ui.people import LabelDialog
+from desk_sentry.ui.visits import VisitWindow, visits_summary
 from desk_sentry.update_check import (
     AvailableRelease,
     UpdateCheckResult,
     check_for_update,
     is_newer_version,
 )
+from desk_sentry.visits import VisitLog
 
 MODEL_NAME = "object_detection_nanodet_2022nov.onnx"
 INSTANCE_NAME = "desk-sentry-v2-instance"
@@ -65,6 +68,11 @@ _NEW_SETTINGS_OUTSIDE_DIAGNOSTICS = frozenset(
     {
         "away_action",
         "away_minutes",
+        "away_guard",
+        "away_guard_save",
+        "away_guard_keep_days",
+        "away_guard_when_locked",
+        "away_guard_seen_at",
         "camera_mode",
         "camera_id",
         "camera_name",
@@ -325,6 +333,22 @@ class DeskSentryApp:
         self.history = AlertHistory()
         self.history.on_change = self._history_changed
         self._history_window: HistoryWindow | None = None  # created on first open
+        # 離座紀錄: DPAPI-encrypted photos of people seen while the user was away.
+        self.visits = VisitLog(
+            settings_path.parent / "visits",
+            protect=dpapi.protect if dpapi.available() else None,
+            unprotect=dpapi.unprotect if dpapi.available() else None,
+        )
+        self.visits.configure(
+            save=settings.away_guard_save, retention_days=settings.away_guard_keep_days
+        )
+        try:
+            self.visits.load()  # only reads when saving is switched on
+        except OSError as error:
+            logging.getLogger(__name__).info("Cannot read visit photos: %s", error)
+        self.visits.on_change = self._visits_changed
+        self._visit_window: VisitWindow | None = None
+        self.window.on_open_visits = self.open_visits
         self._escalated = False
         self.hotkey = GlobalHotkey(self.toggle_mini)
         self.hotkey.install(app)
@@ -367,14 +391,22 @@ class DeskSentryApp:
         menu.addAction("顯示設定視窗", self.exit_compact)
         self._compact_action = menu.addAction("小鏡子模式", self.enter_compact)
         menu.addAction("最近提醒", lambda: self.open_history(None))
+        self._visits_action = menu.addAction("離座紀錄", self.open_visits)
         self._arm_action = menu.addAction("", self.window.toggle_armed)
         self._yield_camera_action = menu.addAction("", self.toggle_camera_yield)
         self._pause_info = menu.addAction("")
         self._pause_info.setEnabled(False)
         self._pause_info.setVisible(False)
+        # A way out of discreet mode that never depends on finding the settings.
+        self._discreet_off_action = menu.addAction("關閉低調模式", self.leave_discreet)
+        self._discreet_off_action.setVisible(settings.discreet)
         menu.addSeparator()
-        menu.addAction("標記：剛才有人經過卻沒提醒", lambda: self.mark("missed_alert"))
-        menu.addAction("標記：剛才沒人卻提醒了", lambda: self.mark("false_alert"))
+        # Rarely used feedback stays one level down so the menu reads at a glance.
+        report = menu.addMenu("回報提醒不準")
+        report.setStyleSheet(TRAY_MENU_STYLE)
+        report.addAction("剛才有人經過卻沒提醒", lambda: self.mark("missed_alert"))
+        report.addAction("剛才沒人卻提醒了", lambda: self.mark("false_alert"))
+        self._report_menu = report
         menu.addSeparator()
         self._update_action = menu.addAction("", self._open_update)
         self._skip_update_action = menu.addAction("略過此版本", self._skip_update)
@@ -383,12 +415,15 @@ class DeskSentryApp:
         self._quit_action = menu.addAction("結束 Desk Sentry", self.quit)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray)
+        self.tray.messageClicked.connect(self._message_clicked)
+        self._message_opens_visits = False
         self.tray.show()
         self._menu = menu
         self.window.on_preview_cue = self.preview_cue
         self._hint_shown = False
         self.window.on_hide_to_tray = self._hidden_to_tray
         self._render_tray(settings, Status.PAUSED)
+        self._visits_changed()  # photos kept from an earlier session
         if self.people.load_error:
             self._notify(
                 "Desk Sentry",
@@ -453,6 +488,15 @@ class DeskSentryApp:
             self._set_mark_hotkey("false_alarm", settings.mark_false_hotkey)
             self._set_mark_hotkey("real", settings.mark_real_hotkey)
         self._render_tray(settings, self._last_status or Status.PAUSED)
+        if hasattr(self, "visits"):
+            was_saving = self.visits.persistent
+            self.visits.configure(
+                save=settings.away_guard_save, retention_days=settings.away_guard_keep_days
+            )
+            if self.visits.persistent and not was_saving:
+                with contextlib.suppress(OSError):
+                    self.visits.load()
+            self._visits_changed()
         if hasattr(self, "_update_timer"):
             self._configure_updates()
 
@@ -530,9 +574,17 @@ class DeskSentryApp:
             )
             self._refresh_update_prompt()
 
+    def leave_discreet(self) -> None:
+        """Turn discreet mode off from the tray, then show the familiar window."""
+
+        self.window.update_settings(discreet=False)
+        self.show_current()
+
     def _sync_discreet_presentation(self, settings: Settings) -> None:
         if hasattr(self, "_compact_action"):
             self._compact_action.setVisible(not settings.discreet)
+        if hasattr(self, "_discreet_off_action"):
+            self._discreet_off_action.setVisible(settings.discreet)
         previous = self._discreet_active
         if not settings.discreet and not previous:
             return
@@ -594,8 +646,65 @@ class DeskSentryApp:
             self._diagnostics.write(kind, **fields)
 
     def _notify(self, title: str, text: str, icon: QIcon, timeout_ms: int) -> None:
-        if not self.window.settings.discreet:
-            self.tray.showMessage(title, text, icon, timeout_ms)
+        tray = getattr(self, "tray", None)  # camera events can precede the tray icon
+        if tray is not None and not self.window.settings.discreet:
+            self._message_opens_visits = False
+            tray.showMessage(title, text, icon, timeout_ms)
+
+    def _explain_exclusive_camera(self) -> None:
+        """Say once, in plain words, what to do when a meeting cannot get the camera."""
+
+        if getattr(self, "_exclusive_hint_shown", False):
+            return
+        self._exclusive_hint_shown = True
+        self._notify(
+            "Desk Sentry 正在使用攝影機",
+            "這支攝影機無法和其他程式共用。開會拿不到畫面時，"
+            "右鍵系統匣圖示，選「暫時讓出攝影機」。",
+            theme.app_icon(),
+            8000,
+        )
+
+    def _message_clicked(self) -> None:
+        if self._message_opens_visits:
+            self._message_opens_visits = False
+            self.open_visits()
+
+    # ------------------------------------------------------------ away guard
+    def _unseen_visits(self) -> int:
+        return self.visits.unseen(self.window.settings.away_guard_seen_at)
+
+    def _announce_visits(self) -> None:
+        if not hasattr(self, "visits"):
+            return  # session events can arrive while the app is still starting
+        unseen = self._unseen_visits()
+        if not unseen or self.window.settings.discreet:
+            return
+        self._notify(
+            "Desk Sentry 離座紀錄",
+            f"{visits_summary(unseen)}，點這裡查看照片。",
+            theme.app_icon(),
+            8000,
+        )
+        self._message_opens_visits = True
+
+    def _visits_changed(self) -> None:
+        unseen = self._unseen_visits()
+        self.window.set_unseen_visits(unseen)
+        if hasattr(self, "_visits_action"):
+            count = len(self.visits)
+            self._visits_action.setText(f"離座紀錄（{unseen} 則新）" if unseen else "離座紀錄")
+            self._visits_action.setVisible(self.window.settings.away_guard or count > 0)
+        if self._visit_window is not None and self._visit_window.isVisible():
+            self._visit_window.refresh()
+
+    def open_visits(self) -> None:
+        self.visits.expire()
+        if self._visit_window is None:
+            self._visit_window = VisitWindow(self.visits)
+            self._visit_window.on_cleared = self._visits_changed
+        self._visit_window.open()
+        self.window.update_settings(away_guard_seen_at=self._wall_now().timestamp())
 
     def mark(self, kind: str) -> None:
         if kind in ("false_alarm", "real"):
@@ -636,7 +745,12 @@ class DeskSentryApp:
         self._apply_monitoring()
 
     def _session_changed(self, locked: bool) -> None:
+        was_locked = self._locked
         self._locked = locked
+        if was_locked and not locked:
+            # Only the owner can unlock: the right moment to tell them, never
+            # while whoever sat down at an unlocked desk might be reading.
+            self._announce_visits()
         self._apply_monitoring()
 
     def _meeting_changed(self, active: bool) -> None:
@@ -677,7 +791,11 @@ class DeskSentryApp:
             reason = "manual"
         elif self._manual_yield:
             reason = "manual_yield"
-        elif self._locked and settings.pause_when_locked:
+        elif (
+            self._locked
+            and settings.pause_when_locked
+            and not (settings.away_guard and settings.away_guard_when_locked)
+        ):
             reason = "locked"
         elif not in_schedule:
             reason = "schedule"
@@ -754,6 +872,8 @@ class DeskSentryApp:
             backend = "pending"
         backend_changed = backend != self._camera_backend
         self._camera_backend = backend
+        if backend_changed and backend == "exclusive":
+            self._explain_exclusive_camera()
         self._camera_backend_detail = snap.backend_detail or ""
         self._camera_subtype = snap.subtype or ""
         self._camera_width = snap.width
@@ -773,6 +893,13 @@ class DeskSentryApp:
         acknowledged_reason = getattr(snap, "pause_reason", None)
         acknowledged_request = getattr(snap, "pause_request", 0)
         if snap.health_reason == "camera_release_failed":
+            if not self._camera_release_failed:
+                self._notify(
+                    "Desk Sentry 無法讓出攝影機",
+                    "如果會議軟體拿不到畫面，請右鍵系統匣圖示，選「結束 Desk Sentry」。",
+                    theme.app_icon(),
+                    8000,
+                )
             self._camera_release_failed = True
         elif self._effective_armed and snap.status is not Status.PAUSED:
             self._camera_release_failed = False
@@ -868,6 +995,11 @@ class DeskSentryApp:
             or (self.window.isVisible() and not self.window.isMinimized())
         )
 
+        visit = getattr(snap, "visit_shot", None)
+        if visit is not None and settings.away_guard:
+            self.visits.add(
+                visit.visit_id, visit.image, seated=visit.seated, taken_at=visit.taken_at
+            )
         if snap.alert_thumbnail is not None:
             self.history.add(
                 snap.alert_thumbnail,

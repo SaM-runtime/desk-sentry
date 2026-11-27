@@ -448,6 +448,8 @@ class MainWindow(QMainWindow):
         self.on_check_updates: Callable[[], None] | None = None
         self.on_open_update: Callable[[], None] | None = None
         self.on_skip_update: Callable[[], None] | None = None
+        self.on_open_visits: Callable[[], None] | None = None
+        self._unseen_visits = 0
         self._update_checking = False
         self._display_version = display_version or get_build_info().display_version
         self._settings = settings
@@ -491,6 +493,7 @@ class MainWindow(QMainWindow):
         self._scrim.hide()
         self._render_armed()
         self._sync_discreet_ui()
+        self._sync_away_guard_ui()
         self._sync_responsive_layout(force=True)
         self._request_camera_list()
 
@@ -554,7 +557,38 @@ class MainWindow(QMainWindow):
         resume = getattr(self.mirror, "resume_requested", None)
         if resume is not None:
             resume.connect(self._resume_if_manual)
+        self.visits_banner = QPushButton()
+        self.visits_banner.setObjectName("visitsBanner")
+        self.visits_banner.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.visits_banner.setFixedHeight(theme.D["control_height"] + theme.D["space_8"])
+        self.visits_banner.setStyleSheet(
+            f"QPushButton#visitsBanner {{ background: {theme.SELECTION}; color: {theme.TEXT};"
+            f" border: 1px solid {theme.ACCENT}; border-radius: {theme.RADIUS['control']}px;"
+            " text-align: left; padding: 0 12px; font-weight: 600; }"
+            f"QPushButton#visitsBanner:hover {{ border-color: {theme.ACCENT_HOVER}; }}"
+        )
+        self.visits_banner.clicked.connect(
+            lambda: self.on_open_visits() if self.on_open_visits else None
+        )
+        self.visits_banner.hide()
+        layout.addWidget(self.visits_banner)
+        self._visits_banner_gap = QWidget()
+        self._visits_banner_gap.setFixedHeight(theme.D["space_12"])
+        self._visits_banner_gap.hide()
+        layout.addWidget(self._visits_banner_gap)
         layout.addWidget(self.mirror, 1)
+        self.leave_discreet_button = QPushButton("關閉低調模式")
+        self.leave_discreet_button.setObjectName("secondaryButton")
+        self.leave_discreet_button.setFixedHeight(theme.D["control_height"])
+        self.leave_discreet_button.setToolTip("恢復顯示攝影機畫面與一般提醒")
+        self.leave_discreet_button.clicked.connect(lambda: self._update(discreet=False))
+        self.leave_discreet_button.hide()
+        leave_row = QHBoxLayout()
+        leave_row.setContentsMargins(0, theme.D["space_12"], 0, 0)
+        leave_row.addStretch(1)
+        leave_row.addWidget(self.leave_discreet_button)
+        leave_row.addStretch(1)
+        layout.addLayout(leave_row)
         self.pause_reason = QLabel()
         self.pause_reason.setObjectName("pauseReason")
         self.pause_reason.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -603,11 +637,26 @@ class MainWindow(QMainWindow):
         form.setSpacing(0)
         s = self._settings
 
-        def add_section(title: str, card: _SettingsCard, *, first: bool = False) -> None:
-            form.addSpacing(theme.D["section_first_top"] if first else theme.D["section_gap"])
-            form.addWidget(_section(title))
-            form.addSpacing(theme.D["space_8"])
-            form.addWidget(card)
+        # Testers found one long list of ~35 settings overwhelming. Everyday
+        # choices stay on top; everything else waits behind 「進階設定」.
+        basic_sections: dict[str, _SettingsCard] = {}
+        advanced_sections: list[tuple[str, _SettingsCard]] = []
+
+        def add_section(title: str, card: _SettingsCard, *, advanced: bool = True) -> None:
+            if advanced:
+                advanced_sections.append((title, card))
+            else:
+                basic_sections[title] = card
+
+        def place_sections(
+            layout: QVBoxLayout, sections: list[tuple[str, _SettingsCard]], *, first: bool
+        ) -> None:
+            for index, (title, card) in enumerate(sections):
+                top = first and index == 0
+                layout.addSpacing(theme.D["section_first_top"] if top else theme.D["section_gap"])
+                layout.addWidget(_section(title))
+                layout.addSpacing(theme.D["space_8"])
+                layout.addWidget(card)
 
         discreet = _SettingsCard()
         self.discreet = Switch()
@@ -617,7 +666,7 @@ class MainWindow(QMainWindow):
             _setting_row(
                 "低調模式",
                 self.discreet,
-                "偵測照常，不顯示畫面，改用低調提示",
+                "偵測照常，只是不顯示畫面。隨時可從系統匣選單「關閉低調模式」",
             )
         )
         self.discreet_cue = _combo(_DISCREET_CUES, s.discreet_cue)
@@ -673,7 +722,7 @@ class MainWindow(QMainWindow):
         detail.addWidget(self.offline_screens)
         discreet.add_row(self.discreet_screen_detail)
         self.screen_catalog.changed.connect(self._refresh_screen_ui)
-        add_section("低調模式", discreet, first=True)
+        add_section("低調模式", discreet)
 
         detection = _SettingsCard()
         self.sensitivity = SegmentedControl(_SENSITIVITY, s.sensitivity)
@@ -686,12 +735,13 @@ class MainWindow(QMainWindow):
         sensitivity_layout.addWidget(self._sensitivity_hint)
         self.sensitivity.currentIndexChanged.connect(self._sensitivity_changed)
         detection.add_row(_setting_row("靈敏度", sensitivity_box, stacked=True))
+        detection_more = _SettingsCard()
         self.far_passersby = Switch()
         self.far_passersby.setChecked(s.alert_far_passersby)
         self.far_passersby.toggled.connect(
             lambda value: self._update(alert_far_passersby=bool(value))
         )
-        detection.add_row(
+        detection_more.add_row(
             _setting_row("遠處經過的人也提醒", self.far_passersby, "預設只標示，走近才提醒")
         )
         self.still = Stepper()
@@ -702,7 +752,9 @@ class MainWindow(QMainWindow):
         self.still.valueChanged.connect(
             lambda value: self._update(stationary_mute_seconds=float(value))
         )
-        detection.add_row(_setting_row("靜止多久後不再提醒", self.still, "例如坐在你後面的同事"))
+        detection_more.add_row(
+            _setting_row("靜止多久後不再提醒", self.still, "例如坐在你後面的同事")
+        )
         self.camera = _CameraDropDown()
         self.camera.setFixedSize(theme.D["dropdown_width"], theme.D["control_height"])
         self.camera.addItem("讀取中…", None)
@@ -714,7 +766,7 @@ class MainWindow(QMainWindow):
         self.camera_mode.currentIndexChanged.connect(
             lambda _index: self._update(camera_mode=str(self.camera_mode.currentData()))
         )
-        detection.add_row(
+        detection_more.add_row(
             _setting_row(
                 "攝影機模式",
                 self.camera_mode,
@@ -747,14 +799,76 @@ class MainWindow(QMainWindow):
         self.auto_yield_camera.toggled.connect(
             lambda value: self._update(auto_yield_camera=bool(value))
         )
-        detection.add_row(
+        detection_more.add_row(
             _setting_row(
                 "開會時自動讓出攝影機",
                 self.auto_yield_camera,
                 "只有獨占攝影機時才會暫停監看",
             )
         )
-        add_section("偵測", detection)
+        add_section("偵測", detection, advanced=False)
+        add_section("偵測細節", detection_more)
+
+        guard = _SettingsCard()
+        self.away_guard = Switch()
+        self.away_guard.setChecked(s.away_guard)
+        self.away_guard.toggled.connect(self._away_guard_changed)
+        guard.add_row(
+            _setting_row(
+                "離座看守",
+                self.away_guard,
+                "你離開座位時，有人靠近或坐到你的位子就拍一張照片",
+            )
+        )
+        # Each privacy-relevant part is its own switch, off by default, and only
+        # shown once the guard itself is on.
+        self.away_guard_save = Switch()
+        self.away_guard_save.setChecked(s.away_guard_save)
+        self.away_guard_save.toggled.connect(
+            lambda value: self._update(away_guard_save=bool(value))
+        )
+        self.away_guard_save_row = guard.add_row(
+            _setting_row(
+                "照片存到這台電腦",
+                self.away_guard_save,
+                "以你的 Windows 帳號加密。關閉時照片只留到程式結束，已存的檔案會刪除",
+                dependent=True,
+            )
+        )
+        self.away_guard_keep_days = _combo(
+            [(str(days), f"{days} 天") for days in (1, 3, 7, 30)], str(s.away_guard_keep_days)
+        )
+        self.away_guard_keep_days.currentIndexChanged.connect(
+            lambda _index: self._update(
+                away_guard_keep_days=int(self.away_guard_keep_days.currentData())
+            )
+        )
+        self.away_guard_keep_row = guard.add_row(
+            _setting_row("保留天數", self.away_guard_keep_days, "到期自動刪除", dependent=True)
+        )
+        self.away_guard_when_locked = Switch()
+        self.away_guard_when_locked.setChecked(s.away_guard_when_locked)
+        self.away_guard_when_locked.toggled.connect(
+            lambda value: self._update(away_guard_when_locked=bool(value))
+        )
+        self.away_guard_locked_row = guard.add_row(
+            _setting_row(
+                "鎖定電腦時也看守",
+                self.away_guard_when_locked,
+                "要防止別人趁你不在時偷用電腦，建議開啟，離開時按 Win+L",
+                dependent=True,
+            )
+        )
+        self.open_visits_button = QPushButton("查看離座紀錄")
+        self.open_visits_button.setObjectName("secondaryButton")
+        self.open_visits_button.setFixedHeight(theme.D["control_height"])
+        self.open_visits_button.clicked.connect(
+            lambda: self.on_open_visits() if self.on_open_visits else None
+        )
+        self.away_guard_detail_row = guard.add_row(
+            _setting_row("離座紀錄", self.open_visits_button, dependent=True)
+        )
+        add_section("離座看守", guard, advanced=False)
 
         yourself = _SettingsCard()
         self.exclude_self = Switch()
@@ -797,7 +911,7 @@ class MainWindow(QMainWindow):
         self.sound.toggled.connect(lambda value: self._update(sound=bool(value)))
         self.sound_row = alerts.add_row(_setting_row("提示音", self.sound, "低調模式開啟中"))
         self.sound_notice = _required_hint(self.sound_row)
-        add_section("提醒方式", alerts)
+        add_section("提醒方式", alerts, advanced=False)
         evade = _SettingsCard()
         self.action = _combo(_ACTIONS, s.action)
         self.action.currentIndexChanged.connect(self._action_changed)
@@ -865,7 +979,7 @@ class MainWindow(QMainWindow):
             _setting_row("等待時間", self.away_minutes, dependent=True)
         )
         self._set_dependency(self.away_minutes_row, s.away_action != "none")
-        add_section("離座時", away)
+        add_section("離座時自動動作", away)
         self._sync_target_rows()
 
         known = _SettingsCard()
@@ -890,13 +1004,16 @@ class MainWindow(QMainWindow):
             known.add_row(people_wrap)
         add_section("認得的人", known)
 
-        system = _SettingsCard()
+        general = _SettingsCard()
         if self._autostart is not None:
             get_autostart, _ = self._autostart
             self.autostart = Switch()
             self.autostart.setChecked(get_autostart())
             self.autostart.toggled.connect(self._toggle_autostart)
-            system.add_row(_setting_row("開機自動啟動", self.autostart))
+            general.add_row(_setting_row("開機自動啟動", self.autostart))
+            add_section("一般", general, advanced=False)
+        shortcuts = _SettingsCard()
+        system = _SettingsCard()
         self.hotkey = QKeySequenceEdit(QKeySequence(s.mirror_hotkey))
         self.hotkey.setObjectName("hotkeyEdit")
         self.hotkey.setFixedSize(theme.D["dropdown_width"], theme.D["control_height"])
@@ -912,7 +1029,7 @@ class MainWindow(QMainWindow):
         hotkey_layout.setSpacing(theme.D["space_4"])
         hotkey_layout.addWidget(self.hotkey)
         hotkey_layout.addWidget(self.hotkey_hint)
-        self.small_mirror_row = system.add_row(
+        self.small_mirror_row = shortcuts.add_row(
             _setting_row("小鏡子快捷鍵", hotkey_block, "低調模式開啟中")
         )
         self.small_mirror_notice = _required_hint(self.small_mirror_row)
@@ -936,10 +1053,10 @@ class MainWindow(QMainWindow):
         hide_hotkey_layout.setSpacing(theme.D["space_4"])
         hide_hotkey_layout.addWidget(self.hide_hotkey)
         hide_hotkey_layout.addWidget(self.hide_hotkey_hint)
-        system.add_row(_setting_row("隱藏視窗快捷鍵", hide_hotkey_block))
+        shortcuts.add_row(_setting_row("隱藏視窗快捷鍵", hide_hotkey_block))
         self.hide_hotkey_style = _combo(_HIDE_HOTKEY_STYLES, s.hide_hotkey_style)
         self.hide_hotkey_style.currentIndexChanged.connect(self._hide_hotkey_style_changed)
-        system.add_row(_setting_row("快捷鍵動作", self.hide_hotkey_style))
+        shortcuts.add_row(_setting_row("快捷鍵動作", self.hide_hotkey_style))
         self.mark_false_hotkey = QKeySequenceEdit(QKeySequence(s.mark_false_hotkey))
         self.mark_real_hotkey = QKeySequenceEdit(QKeySequence(s.mark_real_hotkey))
         self._mark_hotkey_controls = {
@@ -963,7 +1080,7 @@ class MainWindow(QMainWindow):
             block_layout.addWidget(hint)
             title = "誤報標記快捷鍵" if kind == "false_alarm" else "真實標記快捷鍵"
             mark_editor.setAccessibleName(title)
-            system.add_row(_setting_row(title, block))
+            shortcuts.add_row(_setting_row(title, block))
         for shortcut_editor in (
             self.hotkey,
             self.hide_hotkey,
@@ -980,7 +1097,10 @@ class MainWindow(QMainWindow):
         self.pause_when_locked.toggled.connect(
             lambda value: self._update(pause_when_locked=bool(value))
         )
-        system.add_row(_setting_row("電腦鎖定時暫停", self.pause_when_locked))
+        self.pause_when_locked_row = system.add_row(
+            _setting_row("電腦鎖定時暫停", self.pause_when_locked, "已開啟「鎖定電腦時也看守」")
+        )
+        self.pause_when_locked_notice = _required_hint(self.pause_when_locked_row)
         self.diagnostics = Switch()
         self.diagnostics.setChecked(s.diagnostics)
         self.diagnostics.toggled.connect(self._diagnostics_changed)
@@ -1026,6 +1146,7 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.check_updates_button)
         system.add_row(self.check_updates_row)
         self.refresh_update_status()
+        add_section("快捷鍵", shortcuts)
         add_section("系統", system)
 
         schedule = _SettingsCard()
@@ -1091,6 +1212,40 @@ class MainWindow(QMainWindow):
         self._set_dependency(self.schedule_fields_row, s.schedule_enabled)
         self._set_dependency(self.schedule_days_row, s.schedule_enabled)
         add_section("監看時段", schedule)
+
+        basic_order = ("提醒方式", "偵測", "離座看守", "一般")
+        place_sections(
+            form,
+            [(title, basic_sections[title]) for title in basic_order if title in basic_sections],
+            first=True,
+        )
+        form.addSpacing(theme.D["section_gap"])
+        self.advanced_toggle = QPushButton()
+        self.advanced_toggle.setObjectName("advancedToggle")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setFixedHeight(theme.D["control_height"])
+        self.advanced_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.advanced_toggle.setStyleSheet(
+            f"QPushButton#advancedToggle {{ background: {theme.RAISED}; border: 1px solid"
+            f" {theme.BORDER}; border-radius: {theme.RADIUS['control']}px; color: {theme.TEXT};"
+            " text-align: left; padding: 0 12px; }"
+            f"QPushButton#advancedToggle:hover {{ background: {theme.RAISED_HOVER}; }}"
+            "QPushButton#advancedToggle:focus[keyboardFocus='true'] {"
+            f" border: {theme.D['focus_width']}px solid {theme.ACCENT}; }}"
+        )
+        self.advanced_toggle.toggled.connect(self._set_advanced_visible)
+        form.addWidget(self.advanced_toggle)
+        self.advanced_hint = _hint("低調模式、閃避、快捷鍵、認得的人、監看時段等，平常不需要調整")
+        form.addSpacing(theme.D["space_4"])
+        form.addWidget(self.advanced_hint)
+        self.advanced_box = QWidget()
+        self.advanced_box.setObjectName("advancedSettings")
+        advanced_layout = QVBoxLayout(self.advanced_box)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(0)
+        place_sections(advanced_layout, advanced_sections, first=False)
+        form.addWidget(self.advanced_box)
+        self._set_advanced_visible(False)
 
         form.addStretch(1)
         footer = QWidget()
@@ -1280,6 +1435,7 @@ class MainWindow(QMainWindow):
         )
         self._settings = replace(self._settings, **changes).normalized()  # type: ignore[arg-type]
         self._sync_discreet_ui()
+        self._sync_away_guard_ui()
         if hasattr(self, "update_status_label"):
             self.refresh_update_status()
         self._on_settings(self._settings)
@@ -1614,6 +1770,7 @@ class MainWindow(QMainWindow):
             self._set_dependency(row, not discreet)
             notice.setVisible(discreet)
         self._set_dependency(self.corner_row, not discreet and self.show_mirror.isChecked())
+        self.leave_discreet_button.setVisible(discreet)
         self.compact_button.setEnabled(not discreet)
         self.compact_button.setToolTip("低調模式開啟中" if discreet else "小鏡子模式")
         self.mirror.set_discreet(discreet)
@@ -1628,6 +1785,61 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(icon)
         self.setWindowTitle("Desk Sentry 後照鏡")
         self._toolbar_title.setVisible(True)
+
+    def _set_advanced_visible(self, visible: bool) -> None:
+        self.advanced_box.setVisible(visible)
+        self.advanced_hint.setVisible(not visible)
+        self.advanced_toggle.setText("▾  隱藏進階設定" if visible else "▸  顯示進階設定")
+        self.advanced_toggle.setAccessibleName("進階設定")
+        if self.advanced_toggle.isChecked() != visible:
+            self.advanced_toggle.blockSignals(True)
+            self.advanced_toggle.setChecked(visible)
+            self.advanced_toggle.blockSignals(False)
+
+    def _away_guard_changed(self, enabled: bool) -> None:
+        self._update(away_guard=bool(enabled))
+
+    def _sync_away_guard_ui(self) -> None:
+        s = self._settings
+        for switch, value in (
+            (self.away_guard, s.away_guard),
+            (self.away_guard_save, s.away_guard_save),
+            (self.away_guard_when_locked, s.away_guard_when_locked),
+        ):
+            if switch.isChecked() != value:
+                switch.blockSignals(True)
+                switch.setChecked(value)
+                switch.blockSignals(False)
+        self.away_guard_keep_days.blockSignals(True)
+        self.away_guard_keep_days.setCurrentIndex(
+            max(0, self.away_guard_keep_days.findData(str(s.away_guard_keep_days)))
+        )
+        self.away_guard_keep_days.blockSignals(False)
+        # Progressive disclosure: the guard's options appear only once it is on.
+        for row in (self.away_guard_save_row, self.away_guard_locked_row):
+            row.setVisible(s.away_guard)
+        self.away_guard_keep_row.setVisible(s.away_guard and s.away_guard_save)
+        self.away_guard_detail_row.setVisible(s.away_guard or self._unseen_visits > 0)
+        self.privacy_label.setText(
+            "影像只在記憶體中處理；離座看守照片已加密存在本機。"
+            if s.away_guard and s.away_guard_save
+            else "影像只在記憶體中處理，不錄影、不存檔。"
+        )
+        locked_watch = s.away_guard and s.away_guard_when_locked
+        self._set_dependency(self.pause_when_locked_row, not locked_watch)
+        self.pause_when_locked_notice.setVisible(locked_watch)
+
+    def set_unseen_visits(self, count: int) -> None:
+        self._unseen_visits = max(0, int(count))
+        text = f"你不在座位時，有 {self._unseen_visits} 次有人靠近  ·  查看照片"
+        self.visits_banner.setText(text)
+        self.visits_banner.setAccessibleName(text)
+        self.visits_banner.setVisible(self._unseen_visits > 0)
+        self._visits_banner_gap.setVisible(self._unseen_visits > 0)
+        self.open_visits_button.setText(
+            f"查看離座紀錄（{self._unseen_visits} 則新）" if self._unseen_visits else "查看離座紀錄"
+        )
+        self.away_guard_detail_row.setVisible(self._settings.away_guard or self._unseen_visits > 0)
 
     def _sensitivity_changed(self, _index: int) -> None:
         value = str(self.sensitivity.currentData())

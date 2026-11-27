@@ -20,6 +20,12 @@ from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from desk_sentry.ui import motion, theme
 
 
+def exit_hint(hotkey: str) -> str:
+    """Plain-language way out of the curtain; Esc and a double-click always work."""
+
+    return f"按 Esc、{hotkey} 或連按兩下移開" if hotkey else "按 Esc 或連按兩下移開"
+
+
 class _CurtainWindow(QWidget):
     """One curtain surface bound to one screen."""
 
@@ -59,9 +65,15 @@ class _CurtainWindow(QWidget):
         layout.addStretch(1)
 
     def set_hotkey(self, hotkey: str) -> None:
-        self.instruction.setText(
-            f"按 {hotkey} 或連按兩下移開" if hotkey else "連按兩下或按 Esc 移開"
-        )
+        self.instruction.setText(exit_hint(hotkey))
+
+    def set_discreet(self, discreet: bool) -> None:
+        # The app name stays hidden in discreet mode, but the way out never does:
+        # testers who met a plain black screen could not tell how to remove it.
+        self.title.setVisible(not discreet)
+        size = theme.FONT_SIZES["caption" if discreet else "small"]
+        color = theme.TEXT_3 if discreet else theme.TEXT_2
+        self.instruction.setStyleSheet(f"color: {color}; font-size: {size}px;")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt API
         if event.key() == Qt.Key.Key_Escape:
@@ -263,17 +275,20 @@ class CurtainGroup(QObject):
         self._animations.clear()
 
     def _apply_discreet(self, window: _CurtainWindow) -> None:
-        window.title.setVisible(not self._discreet)
-        window.instruction.setVisible(not self._discreet)
+        window.set_discreet(self._discreet)
 
     def _install_shortcuts(self, hotkey: str) -> None:
         for shortcut in self._shortcuts:
             shortcut.deleteLater()
         self._shortcuts = []
-        if not hotkey:
+        if not self.windows:
             return
-        if self.windows:
-            shortcut = QShortcut(QKeySequence(hotkey), self.windows[0])
+        # Esc works from any Desk Sentry window, not only the focused curtain.
+        sequences = [QKeySequence(Qt.Key.Key_Escape)]
+        if hotkey:
+            sequences.insert(0, QKeySequence(hotkey))
+        for sequence in sequences:
+            shortcut = QShortcut(sequence, self.windows[0])
             shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
             shortcut.activated.connect(self.hide)
             self._shortcuts.append(shortcut)

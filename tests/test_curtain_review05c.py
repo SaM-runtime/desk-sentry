@@ -118,8 +118,8 @@ def test_visible_curtain_removes_only_matching_screen_and_rehomes_shortcut(
 
     assert group.windows == [second_window]
     assert closed == [first_window]
-    assert len(group._shortcuts) == 1
-    assert group._shortcuts[0].parent() is second_window
+    assert len(group._shortcuts) == 2  # the hotkey and Esc
+    assert all(shortcut.parent() is second_window for shortcut in group._shortcuts)
 
     events.screenAdded.emit(replacement)
 
@@ -148,8 +148,8 @@ def test_visible_zero_screen_curtain_updates_shortcut_and_disconnects_when_hidde
     events.screenAdded.emit(added)
     only_window = group.windows[0]
     qtbot.addWidget(only_window)
-    assert len(group._shortcuts) == 1
-    assert group._shortcuts[0].parent() is only_window
+    assert len(group._shortcuts) == 2  # the hotkey and Esc
+    assert all(shortcut.parent() is only_window for shortcut in group._shortcuts)
 
     events.screenRemoved.emit(added)
     assert group.windows == []

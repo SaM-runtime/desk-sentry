@@ -23,6 +23,7 @@ def _window(qtbot: QtBot, settings: Settings, seen: list[Settings] | None = None
     window.resize(1180, 640)
     window.show()
     QApplication.processEvents()
+    window.advanced_toggle.setChecked(True)  # these rows live under 進階設定
     return window
 
 
