@@ -47,8 +47,8 @@ def test_curtain_show_escape_and_copy(qtbot: QtBot, monkeypatch) -> None:
     assert curtain.windowFlags() & Qt.WindowType.Tool
     assert curtain.isFullScreen()
     assert curtain.styleSheet() == f"background: {theme.STAGE};"
-    assert curtain.instruction.text() == "按 Ctrl+Alt+H 或連按兩下移開"
-    assert len(group._shortcuts) == 1
+    assert curtain.instruction.text() == "按 Esc、Ctrl+Alt+H 或連按兩下移開"
+    assert len(group._shortcuts) == 2  # the hotkey and Esc
 
     event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
     curtain.keyPressEvent(event)
@@ -62,7 +62,7 @@ def test_curtain_double_click_and_toggle(qtbot: QtBot, monkeypatch) -> None:
     group.toggle("")
     qtbot.addWidget(group.windows[0])
     assert group.visible
-    assert group.windows[0].instruction.text() == "連按兩下或按 Esc 移開"
+    assert group.windows[0].instruction.text() == "按 Esc 或連按兩下移開"
 
     event = QMouseEvent(
         QEvent.Type.MouseButtonDblClick,

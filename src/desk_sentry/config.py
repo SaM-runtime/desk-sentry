@@ -102,6 +102,11 @@ class Settings:
     restore_after_alert: bool = False
     away_action: str = "none"
     away_minutes: int = 5
+    # 離座看守: photograph people who come to the desk while the user is away.
+    # Photos are DPAPI-encrypted on disk and expire; off until the user opts in.
+    away_guard: bool = False
+    # Visit photos taken after this (wall-clock seconds) count as new.
+    away_guard_seen_at: float = 0.0
     mirror_corner: str = "top-right"
     mirror_width: int = 360
     # Numbers-only diagnostics log (boxes, scores, verdicts); never images.
@@ -169,6 +174,12 @@ class Settings:
         if s.hide_hotkey_style not in HIDE_HOTKEY_STYLES:
             s.hide_hotkey_style = "minimize"
         s.pause_when_locked = bool(s.pause_when_locked)
+        s.away_guard = s.away_guard if isinstance(s.away_guard, bool) else False
+        try:
+            seen_at = float(s.away_guard_seen_at)
+            s.away_guard_seen_at = seen_at if math.isfinite(seen_at) and seen_at > 0 else 0.0
+        except (TypeError, ValueError):
+            s.away_guard_seen_at = 0.0
         s.schedule_enabled = bool(s.schedule_enabled)
         s.schedule_start = normalize_schedule_time(s.schedule_start, DEFAULT_SCHEDULE_START)
         s.schedule_end = normalize_schedule_time(s.schedule_end, DEFAULT_SCHEDULE_END)

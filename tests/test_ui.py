@@ -137,6 +137,7 @@ def test_minimize_app_picker_lists_programs_once(qtbot: QtBot) -> None:
     apps = [("chrome.exe", "Inbox"), ("chrome.exe", "YouTube"), ("line.exe", "LINE")]
     window = MainWindow(Settings(hide_hotkey=""), seen.append, list_apps=lambda: apps)
     qtbot.addWidget(window)
+    window.advanced_toggle.setChecked(True)  # these rows live under 進階設定
     assert not window.target_app_row.isVisibleTo(window)
     window.action.setCurrentIndex(window.action.findData("minimize_app"))
     assert window.target_app_row.isVisibleTo(window)

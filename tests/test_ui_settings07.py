@@ -13,6 +13,7 @@ def test_cover_single_picker_preserves_saved_exe_and_enables_foreground_restore(
         Settings(action="none", cover_app="saved.exe"), saved.append, list_apps=lambda: list(apps)
     )
     qtbot.addWidget(window)
+    window.advanced_toggle.setChecked(True)  # these rows live under 進階設定
     window.show()
     assert window.cover_app.currentData() == "saved.exe"
     assert window.restore_after_alert_row.isVisibleTo(window)

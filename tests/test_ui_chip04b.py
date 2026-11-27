@@ -18,6 +18,7 @@ def test_long_target_app_chip_stays_inside_settings_panel(qtbot: QtBot) -> None:
         list_apps=lambda: [],
     )
     qtbot.addWidget(window)
+    window.advanced_toggle.setChecked(True)  # these rows live under 進階設定
     window.show()
 
     chip = window.target_app_chips[0]

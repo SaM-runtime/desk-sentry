@@ -11,6 +11,7 @@ def _window(qtbot: QtBot, settings: Settings, seen: list[Settings]) -> MainWindo
     window = MainWindow(settings, seen.append)
     qtbot.addWidget(window)
     window.show()
+    window.advanced_toggle.setChecked(True)  # these rows live under 進階設定
     return window
 
 

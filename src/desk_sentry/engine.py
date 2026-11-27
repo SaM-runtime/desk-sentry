@@ -17,6 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from desk_sentry.actions import EVADE_NEAR_HEIGHT_MULTIPLIER
+from desk_sentry.away_guard import AwayGuard, VisitRequest
 from desk_sentry.camera import Camera, Image
 from desk_sentry.config import SENSITIVITY, Settings
 from desk_sentry.detector import Box, Detection
@@ -64,6 +65,8 @@ def _diagnostic_token(value: object) -> str | None:
 
 THUMB_MAX_SIZE = (240, 160)  # width, height: 10 history thumbnails stay under 1 MB
 THUMB_MIN_INTERVAL = 3.0
+# Away-guard photos are evidence the user looks at later: a little larger.
+VISIT_PHOTO_MAX_SIZE = (360, 270)
 _THUMB_PADDING = 0.2
 ERROR_RETRY_SECONDS = 2.0
 CAMERA_FATAL_RETRY_INITIAL = 30.0
@@ -186,6 +189,17 @@ class Snapshot:
     # Acknowledged only after the camera's stop/release has completed.
     pause_reason: str | None = None
     pause_request: int = 0
+    # 離座看守 photo of someone who came while the user was away (RAM here; the
+    # app decides whether to keep it, encrypted, on disk).
+    visit_shot: VisitShot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VisitShot:
+    visit_id: int  # a later shot with the same id replaces the earlier photo
+    image: NDArray[np.uint8]
+    seated: bool  # the person sat down in the user's seat
+    taken_at: float  # wall-clock seconds
 
 
 SnapshotCallback = Callable[[Snapshot], None]
@@ -777,6 +791,21 @@ class Engine:
                 )
             if assessment.calibrated_zone is not None and self._on_zone is not None:
                 self._on_zone(assessment.calibrated_zone)
+            if settings.away_guard:
+                state.visit_requests.extend(
+                    state.away_guard.update(
+                        now,
+                        away=assessment.status is Status.AWAY,
+                        tracks=tracks,
+                        roles=assessment.roles,
+                        frame_height=height,
+                        near_height=SENSITIVITY[settings.sensitivity][2],
+                    )
+                )
+                state.visit_requests = _latest_requests(state.visit_requests)
+            elif state.away_guard.watching or state.visit_requests:
+                state.away_guard.reset()
+                state.visit_requests.clear()
             if (
                 assessment.alert_started or assessment.continued
             ) and now - state.last_thumb >= THUMB_MIN_INTERVAL:
@@ -812,11 +841,13 @@ class Engine:
         with_frame = self.preview_wanted or alerting
         min_gap = 0.02 if with_frame else STATUS_ONLY_INTERVAL
         shot, state.pending_shot = state.pending_shot, None
+        visit = _take_visit_photo(frame, state) if state.visit_requests else None
         if (
             assessment.alert_started
             or assessment.continued
             or assessment.level_raised
             or shot is not None
+            or visit is not None
             or now - state.last_emit >= min_gap
         ):
             state.last_emit = now
@@ -878,6 +909,7 @@ class Engine:
                     camera_fps=camera.fps,
                     analysis_fps=max(0, len(state.analysis_times) - 1) / 2.0,
                     latency_ms=state.latency_ms,
+                    visit_shot=visit,
                 )
             )
             # Report each alert start exactly once.
@@ -930,6 +962,7 @@ def _recognise_tracks(
 
 class _LoopState:
     def __init__(self) -> None:
+        self.away_guard = AwayGuard()  # visit ids stay unique across resets
         self.reset()
 
     def reset(self) -> None:
@@ -949,6 +982,8 @@ class _LoopState:
         self.ids: dict[int, _Identity] = {}
         # track id -> (history item to upgrade, deadline) once a face is visible
         self.face_wanted: dict[int, tuple[int, float]] = {}
+        self.away_guard.reset()
+        self.visit_requests: list[VisitRequest] = []
 
 
 @dataclass(frozen=True, slots=True)
@@ -963,8 +998,30 @@ def _name(ident: _Identity | None) -> str | None:
     return ident.match.name if ident is not None and ident.match is not None else None
 
 
-def alert_thumbnail(frame: Image, boxes: list[Box]) -> NDArray[np.uint8] | None:
-    """Crop around the alerting people, mirrored like the preview, at most 240x160."""
+def _latest_requests(requests: list[VisitRequest]) -> list[VisitRequest]:
+    """Keep one pending photo per visit: the newest one supersedes older ones."""
+
+    latest: dict[int, VisitRequest] = {}
+    for request in requests:
+        latest.pop(request.visit_id, None)
+        latest[request.visit_id] = request
+    return list(latest.values())
+
+
+def _take_visit_photo(frame: Image, state: _LoopState) -> VisitShot | None:
+    """One photo per emitted snapshot keeps each snapshot small."""
+
+    request = state.visit_requests.pop(0)
+    image = alert_thumbnail(frame, [request.box], max_size=VISIT_PHOTO_MAX_SIZE)
+    if image is None:
+        return None
+    return VisitShot(request.visit_id, image, request.seated, time.time())
+
+
+def alert_thumbnail(
+    frame: Image, boxes: list[Box], *, max_size: tuple[int, int] = THUMB_MAX_SIZE
+) -> NDArray[np.uint8] | None:
+    """Crop around the given people, mirrored like the preview, within ``max_size``."""
 
     if not boxes:
         return None
@@ -977,7 +1034,7 @@ def alert_thumbnail(frame: Image, boxes: list[Box]) -> NDArray[np.uint8] | None:
     if right - left < 2 or bottom - top < 2:
         return None
     crop = frame[top:bottom, left:right]  # a view: no full-frame copy
-    scale = min(THUMB_MAX_SIZE[0] / crop.shape[1], THUMB_MAX_SIZE[1] / crop.shape[0], 1.0)
+    scale = min(max_size[0] / crop.shape[1], max_size[1] / crop.shape[0], 1.0)
     size = (max(1, round(crop.shape[1] * scale)), max(1, round(crop.shape[0] * scale)))
     small = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
     return np.ascontiguousarray(cv2.cvtColor(cv2.flip(small, 1), cv2.COLOR_BGR2RGB), np.uint8)

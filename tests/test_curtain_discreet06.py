@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 from pytestqt.qtbot import QtBot
 
-from desk_sentry.ui import motion
+from desk_sentry.ui import motion, theme
 from desk_sentry.ui.curtain import CurtainGroup, _CurtainWindow
 
 
@@ -18,7 +18,7 @@ def _patch_window_boundaries(monkeypatch) -> None:
     monkeypatch.setattr(motion, "animations_enabled", lambda: False)
 
 
-def test_discreet_hides_copy_and_off_restores_it(qtbot: QtBot, monkeypatch) -> None:
+def test_discreet_hides_name_but_keeps_the_way_out(qtbot: QtBot, monkeypatch) -> None:
     _patch_window_boundaries(monkeypatch)
     group = CurtainGroup(screens=tuple(QGuiApplication.screens()))
     group.show("Ctrl+Alt+H")
@@ -27,13 +27,16 @@ def test_discreet_hides_copy_and_off_restores_it(qtbot: QtBot, monkeypatch) -> N
 
     group.set_discreet(True)
     assert window.title.isHidden()
-    assert window.instruction.isHidden()
+    # A plain black screen left testers unable to find the exit.
+    assert not window.instruction.isHidden()
+    assert window.instruction.text() == "按 Esc、Ctrl+Alt+H 或連按兩下移開"
+    assert theme.TEXT_3 in window.instruction.styleSheet()
 
     group.set_discreet(False)
     assert not window.title.isHidden()
     assert not window.instruction.isHidden()
     assert window.title.text() == "Desk Sentry"
-    assert window.instruction.text() == "按 Ctrl+Alt+H 或連按兩下移開"
+    assert window.instruction.text() == "按 Esc、Ctrl+Alt+H 或連按兩下移開"
 
 
 def test_discreet_applies_to_future_windows(qtbot: QtBot, monkeypatch) -> None:
@@ -46,4 +49,4 @@ def test_discreet_applies_to_future_windows(qtbot: QtBot, monkeypatch) -> None:
     qtbot.addWidget(window)
 
     assert window.title.isHidden()
-    assert window.instruction.isHidden()
+    assert not window.instruction.isHidden()
